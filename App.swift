@@ -170,6 +170,15 @@ private func backendReply(_ request: [String: Any]) async -> [String: Any] {
         ?? ["ok": false, "error": "后台响应异常，请刷新后重试。"]
 }
 
+struct UpdateInfo: Decodable, Identifiable {
+    let latest: String
+    let notes: String
+    let url: String
+    let sha256: String
+    let page: String
+    var id: String { latest }
+}
+
 struct NodeDelay: Decodable {
     let status: String
     let delay_ms: Int?
@@ -239,6 +248,7 @@ struct ExitLocation: Decodable {
     /// 当前保存（连接中即正在使用）的静态 IP；用于区分用户改选与刷新回填。
     private var activeProfileID = ""
     @Published var configuredServer = ""
+    @Published var update: UpdateInfo?
     @Published var configuredPort = 0
     @Published var exitIP = ""
     @Published var verifiedAt: Date?
@@ -314,18 +324,19 @@ struct ExitLocation: Decodable {
     /// 已连接时选中另一个中转节点即切换过去，无需再点「应用所选出口」；后端事务验证出口，失败自动恢复原节点。
     /// 未连接时只记住选择，仍由用户点「开始连接」接管网络。
     func chooseRelay(_ name: String) {
-        guard running, stateKnown, !recoveryNeeded, !busy, name != activeRelay, let id = selected else { return }
-        call(["op": "switch", "id": id, "relay": name])
+        guard running, stateKnown, !recoveryNeeded, !busy, name != activeRelay else { return }
+        call(["op": "switch", "id": selected ?? "", "relay": name])
     }
 
-    /// 已连接时在静态 IP 列表中改选另一条，即沿用当前中转切换到该静态出口；失败自动恢复原出口。
-    /// 未连接时只改变选择，仍由用户点「开始连接」。
+    /// 已连接时在静态 IP 列表中改选另一条，即沿用当前中转切换到该静态出口；取消选择则改为仅用中转节点出口。
+    /// 失败自动恢复原出口。未连接时只改变选择，仍由用户点「开始连接」。
     func chooseProfile(_ id: String?) {
-        guard running, stateKnown, !recoveryNeeded, !busy, let id, id != activeProfileID,
-              profiles.contains(where: { $0.id == id }) else { return }
+        let target = id ?? ""
+        guard running, stateKnown, !recoveryNeeded, !busy, target != activeProfileID,
+              target.isEmpty || profiles.contains(where: { $0.id == target }) else { return }
         let currentRelay = activeRelay.isEmpty ? relay : activeRelay
         guard !currentRelay.isEmpty else { return }
-        call(["op": "switch", "id": id, "relay": currentRelay])
+        call(["op": "switch", "id": target, "relay": currentRelay])
     }
 
     func nodeDelayHelp(_ name: String) -> String {
@@ -403,6 +414,69 @@ struct ExitLocation: Decodable {
                     return
                 }
             }
+        }
+    }
+
+    /// 启动时（后端限制为每 24 小时一次）或手动检查 GitHub 最新 Release；发现新版本时弹窗。
+    func checkForUpdates(manual: Bool) {
+        Task {
+            let reply = await backendReply(["op": "check_update", "force": manual])
+            if reply["ok"] as? Bool == true, reply["available"] as? Bool == true, let info: UpdateInfo = decode(reply) {
+                update = info
+            } else if manual && !busy {
+                error = reply["ok"] as? Bool != true
+                message = error ? reply["error"] as? String ?? "检查更新失败。"
+                    : "已是最新版本 v\(reply["current"] as? String ?? "")。"
+            }
+        }
+    }
+
+    /// 停止连接、下载并校验 dmg，再交给 update.sh 在应用退出后替换并重新打开。
+    func installUpdate(_ info: UpdateInfo) {
+        guard !busy else { return }
+        let bundle = Bundle.main.bundleURL
+        guard FileManager.default.isWritableFile(atPath: bundle.deletingLastPathComponent().path),
+              let script = Bundle.main.resourceURL?.appendingPathComponent("update.sh") else {
+            if let page = URL(string: info.page) { NSWorkspace.shared.open(page) }
+            message = "当前位置没有写入权限，已打开下载页，请手动安装新版本。"
+            return
+        }
+        busy = true
+        error = false
+        Task {
+            if running || !stateKnown {
+                message = "正在停止连接…"
+                let stopped = await backendReply(["op": "stop"])
+                guard stopped["ok"] as? Bool == true, stopped["running"] as? Bool != true else {
+                    busy = false; error = true
+                    message = stopped["error"] as? String ?? "无法停止连接，已取消更新。"
+                    return
+                }
+            }
+            message = "正在下载 v\(info.latest)…"
+            let reply = await backendReply(["op": "download_update", "url": info.url, "sha256": info.sha256, "version": info.latest])
+            guard reply["ok"] as? Bool == true, let dmg = reply["path"] as? String else {
+                busy = false; error = true
+                message = reply["error"] as? String ?? "下载更新失败。"
+                return
+            }
+            // 替换期间旧应用包会被移走，先把脚本复制到临时目录再运行。
+            let runner = FileManager.default.temporaryDirectory.appendingPathComponent("static-exit-update-\(UUID().uuidString).sh")
+            do {
+                try FileManager.default.copyItem(at: script, to: runner)
+                let task = Process()
+                task.executableURL = URL(fileURLWithPath: "/bin/sh")
+                task.arguments = [runner.path, String(ProcessInfo.processInfo.processIdentifier), dmg, bundle.path]
+                task.standardOutput = FileHandle.nullDevice
+                task.standardError = FileHandle.nullDevice
+                try task.run()
+            } catch {
+                busy = false; self.error = true
+                message = "无法启动更新程序。"
+                return
+            }
+            message = "正在安装 v\(info.latest)，应用将自动重新打开…"
+            NSApplication.shared.terminate(nil)
         }
     }
 
@@ -499,9 +573,9 @@ struct ExitLocation: Decodable {
 
     /// 打开应用或改选出口时预先完成内核校验，使首次「开始连接」命中校验缓存；不占用操作锁。
     func prewarm() {
-        guard !running, stateKnown, !recoveryNeeded, let id = selected, !relay.isEmpty else { return }
+        guard !running, stateKnown, !recoveryNeeded, !relay.isEmpty else { return }
         prewarmTask?.cancel()
-        let request: [String: Any] = ["op": "prewarm", "id": id, "relay": relay]
+        let request: [String: Any] = ["op": "prewarm", "id": selected ?? "", "relay": relay]
         prewarmTask = Task { _ = await backendReply(request) }
     }
 
@@ -548,7 +622,7 @@ struct ExitLocation: Decodable {
     private func apply(_ result: [String: Any]) {
         if let values: [ExitProfile] = decode(result["profiles"]) {
             profiles = values
-            if !profiles.contains(where: { $0.id == selected }) { selected = profiles.first?.id }
+            if !profiles.contains(where: { $0.id == selected }) { selected = nil }
         }
         if let values: [Subscription] = decode(result["subscriptions"]) { subscriptions = values }
         if let value = result["subscription_uid"] as? String {
@@ -577,8 +651,8 @@ struct ExitLocation: Decodable {
             configuredPort = proxy["port"] as? Int ?? 0
         }
         if let value = result["selected_profile_id"] as? String { activeProfileID = value }
-        if let value = result["selected_id"] as? String, profiles.contains(where: { $0.id == value }) {
-            selected = value
+        if let value = result["selected_id"] as? String {
+            selected = profiles.contains(where: { $0.id == value }) ? value : nil
         }
         if let ip = result["ip"] as? String, !ip.isEmpty, running, stateKnown {
             exitIP = ip
@@ -768,9 +842,14 @@ struct ContentView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
         .frame(minWidth: 960, minHeight: 720)
-        .task { model.load() }
+        .task { model.load(); model.checkForUpdates(manual: false) }
+        .alert(item: $model.update) { info in
+            Alert(title: Text("发现新版本 v\(info.latest)"),
+                  message: Text(String(info.notes.prefix(600)) + "\n\n更新会先停止当前连接；完成后需在应用中重新安装一次网络服务。"),
+                  primaryButton: .default(Text("立即更新")) { model.installUpdate(info) },
+                  secondaryButton: .cancel(Text("稍后")))
+        }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.refreshServiceStatus() } }
-        .onChange(of: search) { _, _ in reconcileSelection() }
         .onChange(of: model.prewarmKey) { _, _ in model.prewarm() }
         .onChange(of: model.profiles.map { "\($0.id) \($0.name) \($0.server)" }) { _, _ in reconcileSelection() }
         .sheet(isPresented: $adding) { AddView(model: model) }
@@ -785,10 +864,10 @@ struct ContentView: View {
         .alert(model.running ? "应用这个静态出口？" : "保存这个出口选择？", isPresented: $confirming) {
             Button("取消", role: .cancel) {}
             Button(model.running ? "验证并切换" : "保存选择") {
-                if let id = model.selected { model.call(["op": "switch", "id": id, "relay": model.relay]) }
+                model.call(["op": "switch", "id": model.selected ?? "", "relay": model.relay])
             }
         } message: {
-            Text("\(model.selectedProfile?.server ?? "") · \(model.relay)\n" + (model.running ? "先备份并验证出口，失败恢复原配置。" : "保存静态 IP 和中转节点，点击开始连接后生效。"))
+            Text("\(model.selectedProfile?.server ?? "不使用静态 IP") · \(model.relay)\n" + (model.running ? "先备份并验证出口，失败恢复原配置。" : "保存静态 IP 和中转节点，点击开始连接后生效。"))
         }
         .alert("恢复上次配置？", isPresented: $restoring) {
             Button("取消", role: .cancel) {}
@@ -954,12 +1033,13 @@ struct ContentView: View {
             }
             Spacer()
             Button { model.load() } label: { Label("刷新", systemImage: "arrow.clockwise") }.disabled(model.busy)
-            if model.serviceReady {
-                Menu {
+            Menu {
+                Button("检查更新…") { model.checkForUpdates(manual: true) }.disabled(model.busy)
+                if model.serviceReady {
                     Button("重新安装网络服务") { model.registerService() }.disabled(model.running || !model.stateKnown || model.busy)
-                } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).fixedSize()
-                    .help(model.running ? "停止连接后可重新安装网络服务" : "网络服务")
-            }
+                }
+            } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).fixedSize()
+                .help("检查更新与网络服务")
         }
     }
 
@@ -1026,7 +1106,7 @@ struct ContentView: View {
                 if let at = model.verifiedAt {
                     Text("已实测 · \(at.formatted(date: .omitted, time: .standard))").font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Text(model.checking ? "正在通过当前线路检测…" : (!model.stateKnown ? "无法确认连接状态，请刷新或停止连接" : (model.running ? "检测后显示实际公网出口" : "选择订阅与静态 IP，然后开始连接")))
+                    Text(model.checking ? "正在通过当前线路检测…" : (!model.stateKnown ? "无法确认连接状态，请刷新或停止连接" : (model.running ? "检测后显示实际公网出口" : "选择订阅与中转节点（静态 IP 可选），然后开始连接")))
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -1102,8 +1182,12 @@ struct ContentView: View {
             }
             Divider()
             HStack {
-                Text(model.selectedProfile.map { "已选：\($0.name)" } ?? "选择一条静态 IP").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(model.selectedProfile.map { "已选：\($0.name)" } ?? "未选择静态 IP：国外流量以中转节点为出口").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
+                Button("不使用静态 IP") {
+                    model.selected = nil
+                    model.chooseProfile(nil)
+                }.help("取消选择，仅通过中转节点连接")
                 Button("编辑") { editing = model.selectedProfile }
                 Button("删除") { deleting = true }
             }.controlSize(.small).disabled(model.selected == nil || model.busy).padding(.horizontal, 14).padding(.vertical, 9)
@@ -1136,7 +1220,7 @@ struct ContentView: View {
                 HStack(spacing: 8) {
                     Button(model.running ? "应用所选出口" : "保存选择") { confirming = true }
                         .buttonStyle(ConnectionButtonStyle())
-                        .disabled(model.selected == nil || model.relay.isEmpty || !model.stateKnown || model.recoveryNeeded)
+                        .disabled(model.relay.isEmpty || !model.stateKnown || model.recoveryNeeded)
                     if model.shouldOfferStop {
                         Button {
                             model.call(["op": "stop"]) { ok in if ok { model.load(verify: false) } }
@@ -1145,11 +1229,11 @@ struct ContentView: View {
                         }.buttonStyle(ConnectionButtonStyle(prominent: true, tint: .orange))
                     } else {
                         Button {
-                            if let id = model.selected { model.call(["op": "start", "id": id, "relay": model.relay]) }
+                            model.call(["op": "start", "id": model.selected ?? "", "relay": model.relay])
                         } label: {
                             Label("开始连接", systemImage: "power").frame(minWidth: 80)
                         }.buttonStyle(ConnectionButtonStyle(prominent: true))
-                            .disabled(model.selected == nil || model.relay.isEmpty || model.subscriptionUID.isEmpty || !model.serviceReady || !model.stateKnown || model.recoveryNeeded)
+                            .disabled(model.relay.isEmpty || model.subscriptionUID.isEmpty || !model.serviceReady || !model.stateKnown || model.recoveryNeeded)
                     }
                 }.disabled(model.busy)
             }
@@ -1204,7 +1288,7 @@ struct ContentView: View {
                 Text(model.busy ? model.activity : (model.message.isEmpty ? "就绪 · 订阅与静态 IP 保存在本机" : model.message))
                     .font(.system(size: 12)).textSelection(.enabled).lineLimit(3)
                 Spacer(minLength: 8)
-                Text("独立版 v0.3.12").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                Text("独立版 v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
             }.padding(.horizontal, 18).padding(.vertical, 10).frame(minHeight: 39).background(Color(nsColor: .controlBackgroundColor))
         }
     }
@@ -1219,8 +1303,9 @@ struct ContentView: View {
         !(model.running && item.uid == model.subscriptionUID)
     }
 
+    /// 只在静态 IP 被删除时清除选择；搜索过滤不改变选择，否则会被当作「不使用静态 IP」。
     private func reconcileSelection() {
-        if let id = model.selected, !filtered.contains(where: { $0.id == id }) { model.selected = nil }
+        if let id = model.selected, !model.profiles.contains(where: { $0.id == id }) { model.selected = nil }
     }
 
     private func importCSV() {

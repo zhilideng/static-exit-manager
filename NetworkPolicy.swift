@@ -15,6 +15,8 @@ let staticExitRules = [
     "GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT", "IP-CIDR6,::/0,REJECT,no-resolve",
     "NETWORK,UDP,REJECT", "MATCH,静态IP出口"
 ]
+// 未选择静态 IP：国外 TCP 以选定中转节点为出口，其余规则与静态出口模式一致。
+let relayOnlyRules = Array(staticExitRules.dropLast()) + ["MATCH,静态IP机场中转"]
 
 private func policyFailure(_ message: String = "配置包含不支持的字段或无效值。") -> NetworkFailure { .message(message) }
 private func cleanString(_ value: Any?, max: Int = 8192, empty: Bool = true) -> Bool {
@@ -117,8 +119,8 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
     let safeToken = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
     guard Set(input.keys).isSubset(of: allowed), let token = input["secret"] as? String,
           (32...128).contains(token.utf8.count), token.unicodeScalars.allSatisfy(safeToken.contains),
-          let proxies = input["proxies"] as? [[String: Any]], (2...3000).contains(proxies.count),
-          input["rules"] as? [String] == staticExitRules,
+          let proxies = input["proxies"] as? [[String: Any]], (1...3000).contains(proxies.count),
+          let rules = input["rules"] as? [String], rules == staticExitRules || rules == relayOnlyRules,
           let groups = input["proxy-groups"] as? [[String: Any]], groups.count == 1,
           Set(groups[0].keys) == Set(["name", "type", "proxies"]),
           groups[0]["name"] as? String == "静态IP机场中转", groups[0]["type"] as? String == "select",
@@ -158,7 +160,9 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         } else if node["dialer-proxy"] != nil { throw policyFailure("中转节点不能再指定外部代理链。") }
         normalized.append(clean)
     }
-    guard names.contains("静态IP出口"), choices[0] != "静态IP出口", names.contains(choices[0]) else { throw policyFailure("中转节点不存在。") }
+    let relayOnly = rules == relayOnlyRules
+    guard names.contains("静态IP出口") != relayOnly else { throw policyFailure("配置不符合静态出口服务的范围。") }
+    guard choices[0] != "静态IP出口", names.contains(choices[0]) else { throw policyFailure("中转节点不存在。") }
     let dns: [String: Any] = [
         "enable": true, "listen": "127.0.0.1:17895", "ipv6": false,
         "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
@@ -175,6 +179,6 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         "tun": ["enable": true, "device": "utun78", "stack": "mixed", "auto-route": true,
                 // macOS 默认不注册系统 DNS；显式使用临时 resolver，避免浏览器继续查询局域网 DNS。
                 "auto-detect-interface": true, "strict-route": true, "dns-hijack": ["any:53", "tcp://any:53"], "dns-mode": "native"] as [String: Any],
-        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": staticExitRules
+        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": relayOnly ? relayOnlyRules : staticExitRules
     ]
 }

@@ -64,6 +64,8 @@ RULES = [
     'GEOSITE,cn,DIRECT', 'GEOIP,CN,DIRECT', 'IP-CIDR6,::/0,REJECT,no-resolve',
     'NETWORK,UDP,REJECT', 'MATCH,' + EXIT_NAME,
 ]
+# 未选择静态 IP 时，国外 TCP 直接以中转节点为出口；其余规则（含拒绝国外 UDP）不变。
+RELAY_ONLY_RULES = RULES[:-1] + ['MATCH,' + RELAY_NAME]
 
 
 def now():
@@ -886,9 +888,19 @@ def generate_config(config, profile, relay, preferences):
                     'nameserver': ['https://1.1.1.1/dns-query'],
                     'proxy-server-nameserver': ['https://223.5.5.5/dns-query#DIRECT'],
                     'nameserver-policy': {'geosite:cn': ['https://223.5.5.5/dns-query#DIRECT']}},
-            'proxies': copy.deepcopy(config['proxies']) + [static_proxy(profile)],
+            'proxies': copy.deepcopy(config['proxies']) + ([static_proxy(profile)] if profile else []),
             'proxy-groups': [{'name': RELAY_NAME, 'type': 'select', 'proxies': [relay]}],
-            'rules': RULES[:]}
+            'rules': RULES[:] if profile else RELAY_ONLY_RULES[:]}
+
+
+def chosen_profile(profile_id):
+    """空 ID 表示不使用静态 IP（仅中转节点）；指定了但已不在库中时报错，避免静默改成直连节点。"""
+    if not profile_id:
+        return None
+    profile = next((entry for entry in profiles() if entry['id'] == profile_id), None)
+    if profile is None:
+        raise ValueError('所选静态 IP 已不在库中，请重新选择，或取消选择以仅使用中转节点。')
+    return profile
 
 
 DIAGNOSTICS_MAX_BYTES = 128 * 1024
@@ -1340,7 +1352,8 @@ def await_core(config, timeout=15):
             live = api('/configs', timeout=2)
             nodes = api('/proxies', timeout=2).get('proxies', {})
             if (live.get('mode') == 'rule' and live.get('tun', {}).get('enable') and
-                    EXIT_NAME in nodes and nodes.get(RELAY_NAME, {}).get('now') == desired_relay):
+                    (EXIT_NAME in nodes or config['rules'][-1] == 'MATCH,' + RELAY_NAME) and
+                    nodes.get(RELAY_NAME, {}).get('now') == desired_relay):
                 return
         except (RuntimeError, ValueError):
             pass
@@ -1380,7 +1393,7 @@ def transaction(config, next_settings, expected='', commit=None, rollback_commit
         (DATA / 'pending.json').unlink(missing_ok=True)
         return {'ip': actual, 'verified_at': next_settings['verified_at'],
                 'deferred_checks_pending': True,
-                'message': '配置已应用，静态出口、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
+                'message': '配置已应用，' + ('静态出口' if config['rules'][-1] == 'MATCH,' + EXIT_NAME else '中转出口') + '、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
     except Exception as error:
         try:
             if rollback_commit is not None:
@@ -1409,10 +1422,9 @@ def select_and_apply(uid=None, profile_id=None, relay=None, start=False):
     uid = uid or preferences.get('current_subscription_uid')
     item = subscription(uid)
     source = cached(item)
-    profile_id = profile_id or preferences.get('selected_profile_id')
-    profile = next((entry for entry in profiles() if entry['id'] == profile_id), None)
-    if profile is None:
-        raise ValueError('请先在静态 IP 库中选择一个出口。')
+    # None 沿用上次选择；空字符串表示本次明确不使用静态 IP。
+    profile_id = preferences.get('selected_profile_id', '') if profile_id is None else profile_id
+    profile = chosen_profile(profile_id)
     names = available_nodes(source)
     if relay and relay not in names:
         raise ValueError('所选中转节点已不在订阅中，请刷新后重新选择。')
@@ -1426,8 +1438,8 @@ def select_and_apply(uid=None, profile_id=None, relay=None, start=False):
     if not start and not known_service_status().get('running'):
         validate_core(config)
         put_json(DATA / 'settings.json', preferences)
-        return {**status(), 'message': '已保存静态 IP 和中转选择；点击开始连接后生效。'}
-    result = transaction(config, preferences, profile.get('expected', ''))
+        return {**status(), 'message': ('已保存静态 IP 和中转选择' if profile else '已保存中转选择（不使用静态 IP）') + '；点击开始连接后生效。'}
+    result = transaction(config, preferences, profile.get('expected', '') if profile else '')
     return {**status(), **result}
 
 
@@ -1451,12 +1463,12 @@ def prewarm(profile_id=None, relay=None):
     生成与 select_and_apply 完全相同的配置，使连接时校验缓存命中；不写设置、不连接服务、不访问网络。"""
     preferences = settings()
     uid = preferences.get('current_subscription_uid')
-    profile_id = profile_id or preferences.get('selected_profile_id')
-    profile = next((entry for entry in profiles() if entry['id'] == profile_id), None)
+    profile_id = preferences.get('selected_profile_id', '') if profile_id is None else profile_id
     # 尚未生成控制令牌时，开始连接会新建令牌，预先校验的配置必然不同，直接跳过。
-    if not uid or profile is None or not preferences.get('controller_secret'):
+    if not uid or not preferences.get('controller_secret'):
         return {'prewarmed': False}
     try:
+        profile = chosen_profile(profile_id)
         source = cached(subscription(uid))
         names = available_nodes(source)
         relay = relay if relay in names else preferences['relays'].get(uid)
@@ -1752,9 +1764,10 @@ def update_subscription(uid):
             'usage': merge_subscription_usage(old.get('usage'), usage)}
     preferences = settings(create=True)
     if preferences['current_subscription_uid'] == uid and known_service_status().get('running'):
-        profile = next((entry for entry in profiles() if entry['id'] == preferences['selected_profile_id']), None)
-        if profile is None:
-            raise ValueError('当前静态 IP 已从库中删除，请重新选择后更新。')
+        try:
+            profile = chosen_profile(preferences['selected_profile_id'])
+        except ValueError:
+            raise ValueError('当前静态 IP 已从库中删除，请重新选择后更新。') from None
         relay = preferences['relays'].get(uid)
         if relay not in available_nodes(config):
             raise ValueError('新订阅已移除当前中转节点，已保留旧缓存；请先换中转或停止服务后再更新。')
@@ -1763,10 +1776,10 @@ def update_subscription(uid):
         new_entries = [item if entry['uid'] == uid else entry for entry in original_entries]
         # 新缓存不可变；校验成功前不更改 subscriptions.json 指向的版本。
         put_json(cache_path(item), config)
-        result = transaction(candidate, preferences, profile.get('expected', ''),
+        result = transaction(candidate, preferences, profile.get('expected', '') if profile else '',
                              commit=lambda: put_json(DATA / 'subscriptions.json', new_entries),
                              rollback_commit=lambda: put_json(DATA / 'subscriptions.json', original_entries))
-        return {**status(), **result, 'message': '订阅已更新，静态出口保持可用。'}
+        return {**status(), **result, 'message': '订阅已更新，' + ('静态出口' if profile else '中转出口') + '保持可用。'}
     save_subscription(item, config)
     return {**status(), 'message': '订阅已更新并通过内核校验。'}
 
@@ -2085,12 +2098,104 @@ def restore():
     return {**status(), **result, 'message': '已恢复上次配置并验证出口。'}
 
 
+# 检查更新：读取 GitHub 最新 Release，下载 dmg 并按 Release 公布的 SHA-256 校验；替换应用由界面完成。
+UPDATE_REPO = 'zhilideng/static-exit-manager'
+UPDATE_API = f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest'
+UPDATE_HOSTS = ('github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
+UPDATE_CHECK_SECONDS = 24 * 3600
+UPDATE_MAX_BYTES = 300 * 1024 * 1024
+
+
+def app_version():
+    import plistlib
+    try:
+        with open(Path(__file__).resolve().parent.parent / 'Info.plist', 'rb') as stream:
+            return str(plistlib.load(stream).get('CFBundleShortVersionString', ''))
+    except (OSError, ValueError):
+        return ''
+
+
+def version_tuple(value):
+    parts = re.findall(r'\d+', str(value))[:4]
+    return tuple(int(part) for part in parts) if parts else (0,)
+
+
+def check_update(force=False):
+    current = app_version()
+    state_path = DATA / 'update-check.json'
+    state = read_json(state_path, {}) or {}
+    if not force and time.time() - float(state.get('checked_at', 0)) < UPDATE_CHECK_SECONDS:
+        return {'available': False, 'current': current, 'skipped': True}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    request = urllib.request.Request(UPDATE_API, headers={'Accept': 'application/vnd.github+json',
+                                                          'User-Agent': 'StaticExitManager/' + current})
+    release = None
+    for _ in range(2):  # 网络偶有抖动，失败时再试一次
+        try:
+            with opener.open(request, timeout=15) as response:
+                release = json.loads(response.read(2 * 1024 * 1024))
+            break
+        except (OSError, ValueError):
+            continue
+    if release is None:
+        raise RuntimeError('无法连接 GitHub 检查更新，请稍后重试。')
+    put_json(state_path, {'checked_at': time.time()})
+    latest = str(release.get('tag_name', '')).lstrip('vV')
+    asset = next((item for item in release.get('assets', [])
+                  if re.fullmatch(r'StaticExitManager-[\d.]+-arm64\.dmg', str(item.get('name', '')))), None)
+    if not latest or version_tuple(latest) <= version_tuple(current) or asset is None:
+        return {'available': False, 'current': current, 'latest': latest or current}
+    digest = str(asset.get('digest') or '')
+    sha = digest.split(':', 1)[1] if digest.startswith('sha256:') else ''
+    if not re.fullmatch(r'[0-9a-f]{64}', sha):
+        found = re.search(r'\b([0-9a-f]{64})\b', str(release.get('body', '')))
+        sha = found.group(1) if found else ''
+    if not sha:
+        raise RuntimeError('新版本缺少 SHA-256 校验值，已停止更新。')
+    return {'available': True, 'current': current, 'latest': latest, 'notes': str(release.get('body', ''))[:4000],
+            'url': str(asset.get('browser_download_url', '')), 'sha256': sha, 'size': int(asset.get('size') or 0),
+            'page': str(release.get('html_url', ''))}
+
+
+def download_update(url, sha256, version):
+    parsed = urllib.parse.urlsplit(str(url))
+    if parsed.scheme != 'https' or parsed.hostname != 'github.com' or not re.fullmatch(r'[0-9a-f]{64}', str(sha256)):
+        raise ValueError('更新地址或校验值无效。')
+    target_dir = DATA / 'updates'
+    target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for old in target_dir.glob('*.dmg'):
+        old.unlink(missing_ok=True)
+    target = target_dir / f'StaticExitManager-{re.sub(r"[^0-9.]", "", str(version))}-arm64.dmg'
+    digest, size = hashlib.sha256(), 0
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(urllib.request.Request(url, headers={'User-Agent': 'StaticExitManager'}), timeout=60) as response:
+            if urllib.parse.urlsplit(response.url).hostname not in UPDATE_HOSTS:
+                raise ValueError('更新下载被重定向到未知地址。')
+            with open(target, 'wb') as stream:
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > UPDATE_MAX_BYTES:
+                        raise ValueError('更新文件超出大小限制。')
+                    digest.update(chunk)
+                    stream.write(chunk)
+    except (OSError, ValueError) as error:
+        target.unlink(missing_ok=True)
+        raise RuntimeError('下载更新失败：' + (str(error) if isinstance(error, ValueError) else '网络错误，请稍后重试。')) from None
+    if digest.hexdigest() != sha256:
+        target.unlink(missing_ok=True)
+        raise RuntimeError('更新文件校验失败，已删除下载内容。')
+    return {'path': str(target), 'message': '更新已下载并通过校验。'}
+
+
 def dispatch(request):
     op = request['op']
     if op == 'exit_location': return exit_location(request.get('ip'))
     if op == 'deferred_checks': return deferred_checks()
     if op == 'prewarm': return prewarm(request.get('id'), request.get('relay'))
     if op == 'status': return status()
+    if op == 'check_update': return check_update(bool(request.get('force')))
+    if op == 'download_update': return download_update(request.get('url'), request.get('sha256'), request.get('version'))
     if op == 'node_delays': return node_delays(request.get('subscription_uid'), request.get('names'))
     if op == 'list': return {'profiles': profiles()}
     if op == 'save': return save(request['profile'])
@@ -2141,7 +2246,7 @@ def main():
                     result = {'ok': False, 'error': cancelled}
             print(json.dumps(result, ensure_ascii=False))
             return
-        if request.get('op') in ('exit_location', 'prewarm'):
+        if request.get('op') in ('exit_location', 'prewarm', 'check_update', 'download_update'):
             result = {'ok': True, **dispatch(request)}
             print(json.dumps(result, ensure_ascii=False))
             return

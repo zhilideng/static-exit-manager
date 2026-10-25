@@ -3,8 +3,8 @@
 # 用法：./build.sh [目标目录]，默认安装到 ~/Applications。
 set -eu
 cd "$(dirname "$0")"
-VERSION=0.3.12
-BUILD=16
+VERSION=0.3.13
+BUILD=17
 DEST="${1:-$HOME/Applications}"
 # 独立 Python 来自 uv 管理的 python-build-standalone；也可用 PYTHON_HOME 指定解压后的根目录。
 PYTHON_HOME="${PYTHON_HOME:-$(dirname "$(dirname "$(realpath "$(uv python find --managed-python 3.12)")")")}"
@@ -29,6 +29,7 @@ cp Assets/AppIcon.icns "$RES/AppIcon.icns"
 cp vendor/mihomo vendor/LICENSE-mihomo "$RES/"
 cp vendor/geodata/geosite.dat vendor/geodata/Country.mmdb "$RES/geodata/"
 cp service-scripts/install.sh "$RES/service/install.sh"
+cp service-scripts/update.sh "$RES/update.sh"
 
 # 只保留后台用到的解释器和标准库，去掉 Tk、测试、pip、头文件等。
 PY="$RES/python"

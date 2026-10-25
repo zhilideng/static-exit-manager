@@ -33,6 +33,21 @@ func rejects(_ title: String, _ change: (inout [String: Any]) -> Void) {
 func changeNode(_ input: inout [String: Any], _ index: Int = 0, _ change: (inout [String: Any]) -> Void) {
     var nodes = input["proxies"] as! [[String: Any]]; change(&nodes[index]); input["proxies"] = nodes
 }
+// 仅中转节点：不含静态出口，规则以中转组为 MATCH 出口；混用两种模式的配置一律拒绝。
+func relayOnlyFixture() -> [String: Any] {
+    var input = fixture()
+    input["proxies"] = [(input["proxies"] as! [[String: Any]])[0]]
+    input["rules"] = relayOnlyRules
+    return input
+}
+let relayOnlyOutput = try restrictedConfiguration(relayOnlyFixture())
+check(relayOnlyOutput["rules"] as? [String] == relayOnlyRules, "仅中转规则发生变化")
+check(relayOnlyRules.contains("NETWORK,UDP,REJECT") && relayOnlyRules.last == "MATCH,静态IP机场中转", "仅中转模式未拒绝国外 UDP 或出口不对")
+check((relayOnlyOutput["proxies"] as! [[String: Any]]).count == 1, "仅中转模式节点数量不对"); passed += 3
+rejects("仅中转规则却带静态出口") { $0["rules"] = relayOnlyRules }
+rejects("静态出口规则却缺少静态出口") { $0["proxies"] = [($0["proxies"] as! [[String: Any]])[0]] }
+do { var input = relayOnlyFixture(); input["rules"] = staticExitRules.dropLast() + ["MATCH,DIRECT"]
+     _ = try restrictedConfiguration(input); fatalError("没有拒绝：国外流量直连") } catch { passed += 1 }
 let output = try restrictedConfiguration(fixture())
 check(output["mixed-port"] as? Int == 17896, "监听端口不固定")
 check(output["mode"] as? String == "rule", "规则模式不固定")

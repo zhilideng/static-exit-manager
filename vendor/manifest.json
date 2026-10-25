@@ -1,0 +1,12 @@
+{
+  "mihomo_version": "v1.19.33",
+  "source": "https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33",
+  "release_gzip_sha256": "060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6",
+  "assets": {
+    "mihomo": "f3e8ae41397c08cbf900ce1f7c8a168285d29954e9bca5d84d69a2b2561adfe9",
+    "LICENSE-mihomo": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+    "mihomo.gz": "060b64b0f2c9a310831db0fe4adb2878de67bfa606c311813c1f13966aa504b6",
+    "geodata/geosite.dat": "b697cf0728afa1757297d528a83b5c2270ec06652cee5b788353bc246d6b2cd3",
+    "geodata/Country.mmdb": "ad2a3b90848bccd2065545e295de53b324931f710e0077a1a0fae2b89fddc5e5"
+  }
+}

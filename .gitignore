@@ -1,0 +1,8 @@
+__pycache__/
+dist/
+*.dSYM/
+.DS_Store
+.ruff_cache/
+performance-results/
+vendor/mihomo
+NOTES.local.md

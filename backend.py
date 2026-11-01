@@ -66,6 +66,8 @@ RULES = [
 ]
 # 未选择静态 IP 时，国外 TCP 直接以中转节点为出口；其余规则（含拒绝国外 UDP）不变。
 RELAY_ONLY_RULES = RULES[:-1] + ['MATCH,' + RELAY_NAME]
+# 国内也走静态 IP：只保留本机与局域网直连；静态出口不支持 UDP，公网 UDP（含国内与 WebRTC STUN）一律拒绝。
+GLOBAL_STATIC_RULES = RULES[:11] + RULES[-3:]
 
 
 def now():
@@ -234,6 +236,179 @@ def exit_location(value):
         return {'location': cached}
 
 
+EXIT_TIMEZONE_FILE = 'exit-timezones.json'
+
+
+def valid_timezone(value):
+    # 只接受本机时区数据库中存在的 IANA 名称；网络服务会再次独立校验。
+    return (isinstance(value, str) and re.fullmatch(r'[A-Za-z_]+(/[A-Za-z0-9_+\-]+){1,2}', value) is not None
+            and (Path('/usr/share/zoneinfo') / value).is_file())
+
+
+def exit_timezone(address):
+    """出口 IP 的 IANA 时区；成功结果按 IP 缓存 7 天，只向 ipwho.is 发送已实测的公网 IP。"""
+    address = public_location_ip(address)
+    path = DATA / EXIT_TIMEZONE_FILE
+    entries = read_json(path, {})
+    entries = entries if isinstance(entries, dict) else {}
+    entry = entries.get(address)
+    if (isinstance(entry, dict) and valid_timezone(entry.get('timezone'))
+            and type(entry.get('fetched_at')) in (int, float) and 0 <= time.time() - entry['fetched_at'] <= EXIT_LOCATION_TTL):
+        return entry['timezone']
+    url = 'https://ipwho.is/' + urllib.parse.quote(address, safe='') + '?fields=success,ip,timezone'
+    try:
+        response = subprocess.run(
+            ['/usr/bin/curl', '-q', '--silent', '--show-error', '--fail',
+             '--proxy', '', '--noproxy', '*', '--proto', '=https',
+             '--connect-timeout', '5.5', '--max-time', '5.5', '--max-filesize', '16384', url],
+            capture_output=True, timeout=6)
+        value = json.loads(response.stdout) if not response.returncode else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        value = {}
+    timezone = (value.get('timezone') or {}).get('id') if isinstance(value, dict) and value.get('success') is True and value.get('ip') == address else None
+    if not valid_timezone(timezone):
+        raise RuntimeError('无法查询出口 IP 的时区，请稍后重试。')
+    cleaned = {key: item for key, item in entries.items() if isinstance(item, dict)}
+    cleaned[address] = {'timezone': timezone, 'fetched_at': time.time()}
+    put_json(path, dict(list(cleaned.items())[-EXIT_LOCATION_CACHE_LIMIT:]))
+    return timezone
+
+
+def follow_exit_timezone(address):
+    """把系统时区设为出口 IP 的时区（由网络服务执行，停止连接时自动恢复）；失败只返回提示，不影响连接。"""
+    try:
+        timezone = exit_timezone(address)
+        service('set_timezone', timezone=timezone)
+        return timezone, ''
+    except (RuntimeError, ValueError, OSError) as error:
+        return '', '时区未能跟随出口：' + str(error)
+
+
+def set_sync_timezone(enabled, address=''):
+    preferences = settings()
+    preferences['sync_timezone'] = bool(enabled)
+    put_json(DATA / 'settings.json', preferences)
+    if not known_service_status().get('running'):
+        return {**status(), 'message': '已开启：连接后系统时区将跟随出口。' if enabled else '已关闭时区跟随。'}
+    if not enabled:
+        service('restore_timezone')
+        return {**status(), 'message': '已恢复原系统时区，刷新网页即可生效。'}
+    timezone, warning = follow_exit_timezone(address or preferences.get('last_verified_ip', ''))
+    if warning:
+        preferences['sync_timezone'] = False
+        put_json(DATA / 'settings.json', preferences)
+        raise RuntimeError(warning)
+    return {**status(), 'message': '系统时区已设为出口时区 ' + timezone + '，刷新网页即可生效。'}
+
+
+CHROME_ROOT = Path.home() / 'Library/Application Support/Google/Chrome'
+CHROME_PROCESS = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+CHROME_LANGUAGES = 'en-US,en'
+CHROME_LANGUAGE_BACKUP = 'chrome-language-backup.json'
+
+
+def chrome_pids():
+    """正在运行的 Chrome 主进程（不含 Helper 子进程）。"""
+    found = subprocess.run(['/usr/bin/pgrep', '-x', 'Google Chrome'], capture_output=True, text=True)
+    return [int(pid) for pid in found.stdout.split()]
+
+
+def quit_chrome():
+    """正常退出 Chrome 并等待退出，让它先保存会话与偏好；返回退出前是否在运行。"""
+    pids = chrome_pids()
+    if not pids:
+        return False
+    subprocess.run(['/usr/bin/osascript', '-e', 'quit app id "com.google.Chrome"'], capture_output=True, timeout=20)
+    deadline = time.monotonic() + 20
+    while chrome_pids() and time.monotonic() < deadline:
+        time.sleep(0.3)
+    if chrome_pids():
+        # 未授权自动化时 AppleScript 退出无效；SIGTERM 同样让 Chrome 正常关闭并保存会话。
+        for pid in chrome_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 20
+        while chrome_pids() and time.monotonic() < deadline:
+            time.sleep(0.3)
+    if chrome_pids():
+        raise RuntimeError('Chrome 未能退出，请手动按 ⌘Q 退出后重试。')
+    return True
+
+
+def chrome_profiles():
+    return [path for path in sorted(CHROME_ROOT.glob('*/Preferences')) if path.parent.name != 'System Profile']
+
+
+def apply_chrome_language(enabled):
+    """修改各 Chrome 配置的网页语言（决定 navigator.language 与 Accept-Language）和界面语言。
+
+    登录并同步的配置另有账号级 account_values.intl，优先于本地值，需一并修改（会同步到同一账号的其他设备）。
+    开启前把原值备份到本应用数据目录；关闭时按备份逐项还原。调用前 Chrome 必须已退出，否则会被它覆盖。"""
+    backup_path = DATA / CHROME_LANGUAGE_BACKUP
+    backup = read_json(backup_path, {})
+    backup = backup if isinstance(backup, dict) else {}
+    names = ('selected_languages', 'accept_languages')
+    for path in chrome_profiles():
+        try:
+            preferences = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        key = path.parent.name
+        account = preferences.get('account_values')
+        scopes = {'intl': preferences.setdefault('intl', {})}
+        if isinstance(account, dict) and isinstance(account.get('intl'), dict):
+            scopes['account_intl'] = account['intl']
+        saved = backup.get(key)
+        # 兼容旧版备份：只记录了本地 intl 字段。
+        if isinstance(saved, dict) and 'intl' not in saved and 'account_intl' not in saved:
+            saved = {'intl': saved}
+        if enabled:
+            saved = saved if isinstance(saved, dict) else {}
+            for scope, intl in scopes.items():
+                saved.setdefault(scope, {name: intl[name] for name in names if name in intl})
+            backup[key] = saved
+            put_json(backup_path, backup)
+            for intl in scopes.values():
+                intl['selected_languages'] = CHROME_LANGUAGES
+                intl.pop('accept_languages', None)
+        elif isinstance(saved, dict):
+            for scope, intl in scopes.items():
+                if scope in saved:
+                    for name in names:
+                        intl.pop(name, None)
+                    intl.update(saved[scope])
+        else:
+            continue
+        # 保留 Chrome 原文件权限，原子替换避免写坏配置。
+        mode = path.stat().st_mode & 0o777
+        write(path, json.dumps(preferences, ensure_ascii=False, separators=(',', ':')))
+        os.chmod(path, mode)
+    if enabled:
+        subprocess.run(['/usr/bin/defaults', 'write', 'com.google.Chrome', 'AppleLanguages', '-array', 'en-US'], capture_output=True)
+    else:
+        subprocess.run(['/usr/bin/defaults', 'delete', 'com.google.Chrome', 'AppleLanguages'], capture_output=True)
+        backup_path.unlink(missing_ok=True)
+
+
+def set_browser_language(enabled):
+    """浏览器语言跟随出口：开启时 Chrome 网页与界面语言改为 en-US，关闭时还原；Chrome 运行中会先退出、改完再恢复会话重开。"""
+    preferences = settings()
+    if not enabled and not preferences.get('browser_language') and not (DATA / CHROME_LANGUAGE_BACKUP).exists():
+        return {**status(), 'message': 'Chrome 语言已是原设置。'}
+    if not CHROME_ROOT.is_dir():
+        raise RuntimeError('未找到 Google Chrome 的配置目录。')
+    was_running = quit_chrome()
+    apply_chrome_language(enabled)
+    preferences['browser_language'] = bool(enabled)
+    put_json(DATA / 'settings.json', preferences)
+    if was_running:
+        subprocess.run(['/usr/bin/open', '-a', 'Google Chrome', '--args', '--restore-last-session'], capture_output=True)
+    return {**status(), 'message': ('Chrome 语言已改为 en-US' if enabled else 'Chrome 语言已恢复原设置') +
+            ('，已重新打开并恢复标签页。' if was_running else '，下次打开 Chrome 时生效。')}
+
+
 def executable():
     if len(sys.argv) < 2:
         raise RuntimeError('无法定位应用程序，请从静态出口管理器打开。')
@@ -260,15 +435,17 @@ def node_delay_service_timeout(names):
     return 5 + max(1, rounds) * 6
 
 
-def service(op, config=None, path=None, names=None):
+def service(op, config=None, path=None, names=None, timezone=None):
     request = {'op': op}
+    if timezone is not None:
+        request['timezone'] = timezone
     if config is not None:
         request['config'] = config
     if path is not None:
         request['path'] = path
     if names is not None:
         request['names'] = names
-    timeout = 60 if op in ('start', 'apply', 'stop') else (node_delay_service_timeout(names) if op == 'node_delays' else 8)
+    timeout = 60 if op in ('start', 'apply', 'stop') else (node_delay_service_timeout(names) if op == 'node_delays' else (35 if op in ('set_timezone', 'restore_timezone') else 8))
     result = json.loads(run([executable(), '--service'], json.dumps(request, ensure_ascii=False), timeout=timeout))
     if not result.get('ok'):
         raise RuntimeError(result.get('error') or '独立代理服务不可用，请先在应用中安装并授权服务。')
@@ -872,6 +1049,8 @@ def generate_config(config, profile, relay, preferences):
     token = preferences.get('controller_secret')
     if not token:
         raise RuntimeError('控制接口尚未初始化。')
+    # 只在使用静态 IP 时生效；仅中转模式不受此开关影响。
+    global_static = bool(profile) and bool(preferences.get('global_static'))
     return {'mixed-port': MIXED_PORT, 'allow-lan': False, 'bind-address': '127.0.0.1',
             'secret': token,
             'mode': 'rule', 'ipv6': False, 'log-level': 'warning', 'find-process-mode': 'off',
@@ -887,10 +1066,10 @@ def generate_config(config, profile, relay, preferences):
                     'default-nameserver': ['223.5.5.5'],
                     'nameserver': ['https://1.1.1.1/dns-query'],
                     'proxy-server-nameserver': ['https://223.5.5.5/dns-query#DIRECT'],
-                    'nameserver-policy': {'geosite:cn': ['https://223.5.5.5/dns-query#DIRECT']}},
+                    **({} if global_static else {'nameserver-policy': {'geosite:cn': ['https://223.5.5.5/dns-query#DIRECT']}})},
             'proxies': copy.deepcopy(config['proxies']) + ([static_proxy(profile)] if profile else []),
             'proxy-groups': [{'name': RELAY_NAME, 'type': 'select', 'proxies': [relay]}],
-            'rules': RULES[:] if profile else RELAY_ONLY_RULES[:]}
+            'rules': (GLOBAL_STATIC_RULES[:] if global_static else RULES[:]) if profile else RELAY_ONLY_RULES[:]}
 
 
 def chosen_profile(profile_id):
@@ -1393,7 +1572,7 @@ def transaction(config, next_settings, expected='', commit=None, rollback_commit
         (DATA / 'pending.json').unlink(missing_ok=True)
         return {'ip': actual, 'verified_at': next_settings['verified_at'],
                 'deferred_checks_pending': True,
-                'message': '配置已应用，' + ('静态出口' if config['rules'][-1] == 'MATCH,' + EXIT_NAME else '中转出口') + '、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
+                'message': '配置已应用，' + ('静态出口' if config['rules'][-1] == 'MATCH,' + EXIT_NAME else '中转出口') + ('（国内也走静态 IP）' if config['rules'] == GLOBAL_STATIC_RULES else '') + '、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
     except Exception as error:
         try:
             if rollback_commit is not None:
@@ -1416,9 +1595,11 @@ def transaction(config, next_settings, expected='', commit=None, rollback_commit
         raise RuntimeError('应用失败，已恢复原配置或停止新启动的服务。' + message) from None
 
 
-def select_and_apply(uid=None, profile_id=None, relay=None, start=False):
+def select_and_apply(uid=None, profile_id=None, relay=None, start=False, global_static=None):
     require_settled()
     preferences = settings(create=True)
+    if global_static is not None:
+        preferences['global_static'] = bool(global_static)
     uid = uid or preferences.get('current_subscription_uid')
     item = subscription(uid)
     source = cached(item)
@@ -1439,7 +1620,14 @@ def select_and_apply(uid=None, profile_id=None, relay=None, start=False):
         validate_core(config)
         put_json(DATA / 'settings.json', preferences)
         return {**status(), 'message': ('已保存静态 IP 和中转选择' if profile else '已保存中转选择（不使用静态 IP）') + '；点击开始连接后生效。'}
+    if not start and global_static is not None and not profile:
+        # 仅中转模式下开关不改变运行配置，只记住选择，避免无意义的重连。
+        put_json(DATA / 'settings.json', preferences)
+        return {**status(), 'message': '已记住「国内也走静态 IP」设置；选择静态 IP 后生效。'}
     result = transaction(config, preferences, profile.get('expected', '') if profile else '')
+    if preferences.get('sync_timezone') and result.get('ip'):
+        timezone, warning = follow_exit_timezone(result['ip'])
+        result['message'] += warning or ' 系统时区已跟随出口设为 ' + timezone + '。'
     return {**status(), **result}
 
 
@@ -1953,7 +2141,8 @@ def status():
             'nodes': available_nodes(config), 'node_delays': cached_node_delays(selected['uid'], config) if selected else {},
             'relay': preferences['relays'].get(selected['uid'], '') if selected else '',
             'profiles': profiles(), 'selected_profile_id': preferences['selected_profile_id'], 'selected_id': preferences['selected_profile_id'],
-            'migrated': bool(preferences.get('migrated_at')), 'service_status': state.get('service_status', 'unavailable'),
+            'migrated': bool(preferences.get('migrated_at')), 'global_static': bool(preferences.get('global_static')),
+            'sync_timezone': bool(preferences.get('sync_timezone')), 'browser_language': bool(preferences.get('browser_language')), 'timezone': state.get('timezone', '') if state.get('running') else '', 'service_status': state.get('service_status', 'unavailable'),
             'running': bool(state.get('running')), 'tun': bool(state.get('tun')),
             'mode': 'rule' if state.get('running') else 'stopped', 'mixed_port': state.get('mixed_port', MIXED_PORT),
             'configured_exit': configured, 'backup': (DATA / 'last-backup').exists(),
@@ -2191,6 +2380,8 @@ def download_update(url, sha256, version):
 def dispatch(request):
     op = request['op']
     if op == 'exit_location': return exit_location(request.get('ip'))
+    if op == 'set_browser_language': return set_browser_language(bool(request.get('enabled')))
+    if op == 'set_sync_timezone': return set_sync_timezone(bool(request.get('enabled')), request.get('ip', ''))
     if op == 'deferred_checks': return deferred_checks()
     if op == 'prewarm': return prewarm(request.get('id'), request.get('relay'))
     if op == 'status': return status()
@@ -2209,6 +2400,8 @@ def dispatch(request):
     if op == 'verify': return verify()
     if op in ('start', 'switch'):
         return select_and_apply(request.get('uid'), request.get('id'), request.get('relay'), start=op == 'start')
+    if op == 'set_global_static':
+        return select_and_apply(profile_id=request.get('id'), relay=request.get('relay'), global_static=bool(request.get('enabled')))
     if op == 'select_subscription': return choose_subscription(request['uid'])
     if op == 'stop':
         service('stop')

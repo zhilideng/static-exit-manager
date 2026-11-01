@@ -33,6 +33,8 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in self?.refresh() }
         timer.resume(); self.timer = timer
+        // 服务重启（含重启电脑）时不会有本服务的内核在运行，遗留的时区修改一律恢复。
+        queue.async { self.restoreTimezone() }
     }
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {
         guard connection.effectiveUserIdentifier == uid_t(policy["uid"] as? Int ?? -1) else { return false }
@@ -50,6 +52,11 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
                 switch op {
                 case "status": value = self.status()
                 case "stop": try self.stop(); value = self.status()
+                case "set_timezone":
+                    guard self.child > 0 else { throw NetworkFailure.message("请先连接，再让时区跟随出口。") }
+                    guard let name = request["timezone"] as? String, validTimezoneName(name) else { throw NetworkFailure.message("时区名称无效。") }
+                    try self.setTimezone(name); value = self.status()
+                case "restore_timezone": self.restoreTimezone(); value = self.status()
                 case "start", "apply":
                     guard let raw = request["config"] as? [String: Any] else { throw NetworkFailure.message("缺少配置。") }
                     var config = try restrictedConfiguration(raw)
@@ -81,13 +88,57 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
             if waitpid(child, &status, WNOHANG) == child {
                 child = 0; active = nil
                 lastError = "内核已经退出，连接已停止。请检查线路后重新连接。"
+                restoreTimezone()
             }
         }
+        // 「自动设置时区」等系统机制改回时区时，连接期间重新套用出口时区。
+        if child > 0, let name = timezoneOverride, currentTimezone() != name { try? applyTimezone(name) }
+    }
+
+    // 浏览器时区跟随出口：仅在连接期间修改系统时区并暂停「自动设置时区」；
+    // 原设置存于 root 私有运行目录，停止、内核退出或服务重启时恢复。
+    var timezoneOverride: String?
+    var timezoneState: URL { runtime.appendingPathComponent("timezone-original.json") }
+    let autoTimezone = "/Library/Preferences/com.apple.timezone.auto"
+    func currentTimezone() -> String {
+        let link = (try? FileManager.default.destinationOfSymbolicLink(atPath: "/etc/localtime")) ?? ""
+        guard let range = link.range(of: "zoneinfo/") else { return "" }
+        return String(link[range.upperBound...])
+    }
+    func setTimezone(_ name: String) throws {
+        if !FileManager.default.fileExists(atPath: timezoneState.path) {
+            let original = currentTimezone()
+            guard validTimezoneName(original) else { throw NetworkFailure.message("无法读取当前系统时区，未做修改。") }
+            let auto = (try? command("/usr/bin/defaults", ["read", autoTimezone, "Active"], timeout: 5))
+                .flatMap { String(data: $0, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+            try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+            try jsonData(["timezone": original, "auto": auto]).write(to: timezoneState, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: timezoneState.path)
+        }
+        _ = try command("/usr/bin/defaults", ["write", autoTimezone, "Active", "-bool", "false"], timeout: 5)
+        timezoneOverride = name
+        do { try applyTimezone(name) } catch { restoreTimezone(); throw error }
+    }
+    func applyTimezone(_ name: String) throws {
+        if currentTimezone() != name { _ = try command("/usr/sbin/systemsetup", ["-settimezone", name], timeout: 15) }
+        guard currentTimezone() == name else { throw NetworkFailure.message("系统时区设置未生效。") }
+    }
+    func restoreTimezone() {
+        timezoneOverride = nil
+        guard let data = try? Data(contentsOf: timezoneState),
+              let saved = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        if let name = saved["timezone"] as? String, validTimezoneName(name), currentTimezone() != name {
+            _ = try? command("/usr/sbin/systemsetup", ["-settimezone", name], timeout: 15)
+        }
+        if saved["auto"] as? Bool == true {
+            _ = try? command("/usr/bin/defaults", ["write", autoTimezone, "Active", "-bool", "true"], timeout: 5)
+        }
+        try? FileManager.default.removeItem(at: timezoneState)
     }
     func status() -> [String: Any] {
         let routed = child > 0 && routeInterface() == "utun78"
         return ["running": child > 0, "tun": routed, "state_known": true, "service_status": "enabled", "mixed_port": 17896,
-                "pid": Int(child), "service_pid": Int(getpid()), "service_error": child > 0 && !routed ? "内核运行中，但整机 TUN 路由未生效；请停止后检查其他 VPN。" : lastError]
+                "pid": Int(child), "service_pid": Int(getpid()), "timezone": timezoneOverride ?? "", "service_error": child > 0 && !routed ? "内核运行中，但整机 TUN 路由未生效；请停止后检查其他 VPN。" : lastError]
     }
     func routeInterface() -> String {
         let text = String(data: (try? command("/sbin/route", ["-n", "get", "1.1.1.1"], timeout: 2)) ?? Data(), encoding: .utf8) ?? ""
@@ -267,6 +318,7 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
             if child > 0 { kill(pid, SIGKILL); var state: Int32 = 0; waitpid(pid, &state, 0); child = 0 }
         }
         active = nil; lastError = ""
+        restoreTimezone()
         try? FileManager.default.removeItem(at: runtime.appendingPathComponent("controller.sock"))
     }
 }

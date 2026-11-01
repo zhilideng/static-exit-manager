@@ -82,6 +82,99 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result['proxy-groups'][0]['proxies'], ['日本一'])
         self.assertNotIn('evil.example', json.dumps(result))
 
+    def test_global_static_sends_domestic_traffic_through_static_exit(self):
+        result = b.generate_config(self.source, self.profile, '日本一', {**self.preferences, 'global_static': True})
+        self.assertEqual(result['rules'], b.GLOBAL_STATIC_RULES)
+        self.assertFalse(any(rule.startswith(('GEOSITE', 'GEOIP')) for rule in result['rules']))
+        self.assertEqual(result['rules'][-2:], ['NETWORK,UDP,REJECT', 'MATCH,静态IP出口'])
+        self.assertIn('IP-CIDR,192.168.0.0/16,DIRECT,no-resolve', result['rules'])
+        self.assertNotIn('nameserver-policy', result['dns'])
+        self.assertEqual(result['dns']['proxy-server-nameserver'], ['https://223.5.5.5/dns-query#DIRECT'])
+        # 不使用静态 IP 时开关不生效，仍按仅中转规则运行。
+        relay_only = b.generate_config(self.source, None, '日本一', {**self.preferences, 'global_static': True})
+        self.assertEqual(relay_only['rules'], b.RELAY_ONLY_RULES)
+        self.assertIn('nameserver-policy', relay_only['dns'])
+
+    def test_timezone_follows_exit_and_restores_when_disabled(self):
+        b.put_json(self.data / 'settings.json', {**self.preferences, 'last_verified_ip': '8.8.4.4'})
+        reply = subprocess.CompletedProcess([], 0, json.dumps({'success': True, 'ip': '8.8.4.4', 'timezone': {'id': 'America/Los_Angeles'}}).encode(), b'')
+        with patch.object(b, 'known_service_status', return_value={'running': True}), \
+             patch.object(b, 'status', return_value={}), \
+             patch.object(b.subprocess, 'run', return_value=reply) as run, \
+             patch.object(b, 'service', return_value={'ok': True}) as service:
+            result = b.dispatch({'op': 'set_sync_timezone', 'enabled': True})
+            self.assertIn('America/Los_Angeles', result['message'])
+            service.assert_called_with('set_timezone', timezone='America/Los_Angeles')
+            self.assertIn('8.8.4.4', run.call_args.args[0][-1])
+            self.assertTrue(b.settings()['sync_timezone'])
+            # 缓存命中不再联网；关闭时由网络服务恢复原时区。
+            b.dispatch({'op': 'set_sync_timezone', 'enabled': True})
+            run.assert_called_once()
+            b.dispatch({'op': 'set_sync_timezone', 'enabled': False})
+            service.assert_called_with('restore_timezone')
+            self.assertFalse(b.settings()['sync_timezone'])
+
+    def test_timezone_failure_turns_toggle_back_off(self):
+        b.put_json(self.data / 'settings.json', {**self.preferences, 'last_verified_ip': '8.8.4.4'})
+        with patch.object(b, 'known_service_status', return_value={'running': True}), \
+             patch.object(b.subprocess, 'run', return_value=subprocess.CompletedProcess([], 22, b'', b'')), \
+             patch.object(b, 'service') as service:
+            with self.assertRaises(RuntimeError): b.dispatch({'op': 'set_sync_timezone', 'enabled': True})
+        service.assert_not_called()
+        self.assertFalse(b.settings()['sync_timezone'])
+
+    def test_chrome_language_switch_backs_up_and_restores_profiles(self):
+        chrome = self.data / 'chrome'
+        for name, intl in (('Default', {'selected_languages': 'zh-CN,zh', 'other': 1}), ('Profile 1', {'accept_languages': 'zh-TW'}), ('System Profile', {})):
+            b.put_json(chrome / name / 'Preferences', {'intl': intl, 'keep': name})
+        b.put_json(chrome / 'Synced' / 'Preferences', {'intl': {'selected_languages': 'zh-CN,zh'},
+                                                       'account_values': {'intl': {'accept_languages': 'zh-CN,zh', 'selected_languages': 'zh-CN,zh'}, 'x': 1}})
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append(args); return subprocess.CompletedProcess(args, 1, '', '')
+        with patch.object(b, 'CHROME_ROOT', chrome), patch.object(b, 'quit_chrome', return_value=True), \
+             patch.object(b, 'status', return_value={}), patch.object(b.subprocess, 'run', side_effect=fake_run):
+            result = b.dispatch({'op': 'set_browser_language', 'enabled': True})
+            default = b.read_json(chrome / 'Default/Preferences', {})
+            self.assertEqual(default['intl'], {'selected_languages': 'en-US,en', 'other': 1})
+            self.assertEqual(default['keep'], 'Default')
+            self.assertEqual(b.read_json(chrome / 'Profile 1/Preferences', {})['intl'], {'selected_languages': 'en-US,en'})
+            self.assertEqual(b.read_json(chrome / 'System Profile/Preferences', {})['intl'], {})
+            synced = b.read_json(chrome / 'Synced/Preferences', {})
+            self.assertEqual(synced['account_values'], {'intl': {'selected_languages': 'en-US,en'}, 'x': 1})
+            self.assertEqual(synced['intl'], {'selected_languages': 'en-US,en'})
+            self.assertIn(['/usr/bin/defaults', 'write', 'com.google.Chrome', 'AppleLanguages', '-array', 'en-US'], calls)
+            self.assertIn(['/usr/bin/open', '-a', 'Google Chrome', '--args', '--restore-last-session'], calls)
+            self.assertIn('重新打开', result['message'])
+            # 重复开启不能用英文覆盖原备份。
+            b.dispatch({'op': 'set_browser_language', 'enabled': True})
+            b.dispatch({'op': 'set_browser_language', 'enabled': False})
+            self.assertEqual(b.read_json(chrome / 'Default/Preferences', {})['intl'], {'selected_languages': 'zh-CN,zh', 'other': 1})
+            self.assertEqual(b.read_json(chrome / 'Profile 1/Preferences', {})['intl'], {'accept_languages': 'zh-TW'})
+            self.assertEqual(b.read_json(chrome / 'Synced/Preferences', {})['account_values']['intl'], {'accept_languages': 'zh-CN,zh', 'selected_languages': 'zh-CN,zh'})
+            self.assertIn(['/usr/bin/defaults', 'delete', 'com.google.Chrome', 'AppleLanguages'], calls)
+            self.assertFalse((self.data / b.CHROME_LANGUAGE_BACKUP).exists())
+            self.assertFalse(b.settings()['browser_language'])
+
+    def test_chrome_language_upgrades_old_backup_with_account_scope(self):
+        chrome = self.data / 'chrome'
+        b.put_json(chrome / 'P' / 'Preferences', {'intl': {'selected_languages': 'en-US,en'},
+                                                  'account_values': {'intl': {'selected_languages': 'zh-CN,zh'}}})
+        b.put_json(self.data / b.CHROME_LANGUAGE_BACKUP, {'P': {'selected_languages': 'zh-CN,zh'}})
+        with patch.object(b, 'CHROME_ROOT', chrome), patch.object(b.subprocess, 'run'):
+            b.apply_chrome_language(True)
+            self.assertEqual(b.read_json(chrome / 'P/Preferences', {})['account_values']['intl'], {'selected_languages': 'en-US,en'})
+            b.apply_chrome_language(False)
+        restored = b.read_json(chrome / 'P/Preferences', {})
+        self.assertEqual(restored['intl'], {'selected_languages': 'zh-CN,zh'})
+        self.assertEqual(restored['account_values']['intl'], {'selected_languages': 'zh-CN,zh'})
+
+    def test_timezone_validation_rejects_untrusted_values(self):
+        self.assertTrue(b.valid_timezone('America/Los_Angeles'))
+        for value in ('../../etc/passwd', 'America/Nowhere', 'UTC; rm', '', None, 8):
+            self.assertFalse(b.valid_timezone(value))
+        with self.assertRaises(ValueError): b.exit_timezone('192.168.1.2')
+
     def test_api_uses_only_privileged_read_bridge(self):
         with patch.object(b, 'service', return_value={'ok': True, 'data': {'running': True}}) as service:
             self.assertEqual(b.api('/configs'), {'running': True})

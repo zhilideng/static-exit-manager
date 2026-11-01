@@ -269,6 +269,12 @@ struct ExitLocation: Decodable {
     @Published var serviceError = ""
     @Published var recoveryNeeded = false
     @Published var migrated = false
+    /// 国内也走静态 IP：仅在使用静态 IP 时生效，公网 UDP 全部拒绝。
+    @Published var globalStatic = false
+    @Published var syncTimezone = false
+    @Published var browserLanguage = false
+    /// 网络服务当前套用的出口时区；空表示系统时区未被修改。
+    @Published var appliedTimezone = ""
     @Published var serviceStatus = serviceRegistrationStatus()
     @Published var hasBackup = false
 
@@ -337,6 +343,26 @@ struct ExitLocation: Decodable {
         let currentRelay = activeRelay.isEmpty ? relay : activeRelay
         guard !currentRelay.isEmpty else { return }
         call(["op": "switch", "id": target, "relay": currentRelay])
+    }
+
+    /// 已连接时立即按当前出口重新应用并验证，失败自动恢复；未连接时只记住设置。
+    func setGlobalStatic(_ enabled: Bool) {
+        guard enabled != globalStatic, stateKnown, !recoveryNeeded, !busy else { return }
+        let profileID = running ? activeProfileID : (selected ?? "")
+        let currentRelay = running && !activeRelay.isEmpty ? activeRelay : relay
+        call(["op": "set_global_static", "enabled": enabled, "id": profileID, "relay": currentRelay])
+    }
+
+    /// 系统时区跟随出口：已连接时立即设置或恢复，刷新网页即可生效；未连接时只记住设置。
+    /// Chrome 网页与界面语言改为 en-US 或还原；Chrome 运行中会被正常退出、修改后恢复会话重开。
+    func setBrowserLanguage(_ enabled: Bool) {
+        guard enabled != browserLanguage, !busy else { return }
+        call(["op": "set_browser_language", "enabled": enabled])
+    }
+
+    func setSyncTimezone(_ enabled: Bool) {
+        guard enabled != syncTimezone, stateKnown, !recoveryNeeded, !busy else { return }
+        call(["op": "set_sync_timezone", "enabled": enabled, "ip": exitIP])
     }
 
     func nodeDelayHelp(_ name: String) -> String {
@@ -489,6 +515,9 @@ struct ExitLocation: Decodable {
         let labels = [
             "status": "正在读取本机配置…", "select_subscription": "正在切换订阅…",
             "switch": running ? "正在验证并切换出口…" : "正在保存出口选择…",
+            "set_global_static": running ? "正在切换国内流量出口并验证…" : "正在保存设置…",
+            "set_sync_timezone": running ? "正在设置系统时区…" : "正在保存设置…",
+            "set_browser_language": "正在退出 Chrome 并修改语言…",
             "verify": "正在验证静态出口、系统 DNS 与网页连接…", "import_current": "正在载入当前静态 IP…",
             "import": "正在导入静态 IP…", "save": "正在保存…", "restore": "正在恢复配置…",
             "delete": "正在删除记录…", "start": "正在启动网络连接并验证出口…",
@@ -497,7 +526,7 @@ struct ExitLocation: Decodable {
             "update_subscription": "正在更新订阅…", "delete_subscription": "正在删除订阅…"
         ]
         activity = labels[op] ?? "正在处理…"
-        if ["verify", "start", "stop", "switch", "select_subscription", "restore"].contains(op) {
+        if ["verify", "start", "stop", "switch", "select_subscription", "restore"].contains(op) || (op == "set_global_static" && running) {
             clearExitVerification()
         }
         Task {
@@ -638,6 +667,10 @@ struct ExitLocation: Decodable {
         if let value = result["service_error"] as? String { serviceError = value }
         if let value = result["recovery_needed"] as? Bool { recoveryNeeded = value }
         if let value = result["migrated"] as? Bool { migrated = value }
+        if let value = result["global_static"] as? Bool { globalStatic = value }
+        if let value = result["sync_timezone"] as? Bool { syncTimezone = value }
+        if let value = result["browser_language"] as? Bool { browserLanguage = value }
+        if let value = result["timezone"] as? String { appliedTimezone = value }
         if let value = result["service_status"] as? String, ["enabled", "notRegistered"].contains(value) { serviceStatus = value }
         if let value = result["backup"] as? Bool { hasBackup = value }
         if let values = result["nodes"] as? [String] {
@@ -669,32 +702,134 @@ struct ExitLocation: Decodable {
     }
 }
 
-struct Pill: View {
-    var title: String
-    var symbol: String
-    var color: Color = .secondary
-    var body: some View {
-        Label(title, systemImage: symbol).font(.system(size: 11, weight: .medium))
-            .foregroundStyle(color).padding(.horizontal, 9).padding(.vertical, 5)
-            .background(color.opacity(0.09), in: Capsule())
+private extension NSColor {
+    convenience init(rgb: UInt32) {
+        self.init(srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                  blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
     }
 }
 
-struct ConnectionButtonStyle: ButtonStyle {
-    var prominent = false
-    var tint: Color = .blue
+/// 界面配色：浅色取自设计稿，深色为对应的暗色版本。
+enum Palette {
+    static func dynamic(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            NSColor(rgb: appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light)
+        })
+    }
+    static let accent = dynamic(0x2563EB, 0x3B82F6)
+    static let accentText = dynamic(0x1D4ED8, 0x93B4FB)
+    static let accentSoft = dynamic(0xEEF3FE, 0x1E2A44)
+    static let accentBorder = dynamic(0xC9D8FB, 0x34507F)
+    static let selected = dynamic(0xF5F8FF, 0x1A2236)
+    static let text = dynamic(0x111827, 0xF3F4F6)
+    static let text2 = dynamic(0x4B5563, 0xA9AFBA)
+    static let text3 = dynamic(0x5F6673, 0x949AA5)
+    static let border = dynamic(0xE4E7EC, 0x33363D)
+    static let divider = dynamic(0xEEF0F3, 0x2A2D33)
+    static let surface = dynamic(0xFFFFFF, 0x1E1F23)
+    static let sidebar = dynamic(0xF2F3F6, 0x18191C)
+    static let subtle = dynamic(0xF7F8FA, 0x25262B)
+    static let chip = dynamic(0xF2F4F7, 0x2C2E33)
+    static let track = dynamic(0xCDD2DA, 0x4A4E57)
+    static let idle = dynamic(0xC4CAD4, 0x555A64)
+    static let success = dynamic(0x067647, 0x4ADE80)
+    static let successSoft = dynamic(0xECFDF3, 0x14301F)
+    static let successDot = dynamic(0x17B26A, 0x22C55E)
+    static let warning = dynamic(0xB54708, 0xFDB022)
+    static let warningSoft = dynamic(0xFFF4E5, 0x3A2A12)
+    static let danger = dynamic(0xB42318, 0xF97066)
+    static let dangerSoft = dynamic(0xFEF3F2, 0x3A1A18)
+    static let dangerBorder = dynamic(0xFECDCA, 0x5A2A26)
+}
+
+enum ExpiryStatus { case ok, soon, expired, unknown }
+
+extension ExitProfile {
+    /// 到期日只取前 10 位 yyyy-MM-dd；未填写或无法解析时为 nil。
+    var daysLeft: Int? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let date = formatter.date(from: String(expired.prefix(10))) else { return nil }
+        let calendar = Calendar.current
+        return calendar.dateComponents([.day], from: calendar.startOfDay(for: Date()), to: calendar.startOfDay(for: date)).day
+    }
+    var expiryStatus: ExpiryStatus {
+        guard let days = daysLeft else { return .unknown }
+        return days < 0 ? .expired : (days <= 14 ? .soon : .ok)
+    }
+}
+
+extension SubscriptionUsage {
+    var daysLeft: Int? {
+        guard let expires_at, expires_at > 0 else { return nil }
+        let calendar = Calendar.current
+        let date = Date(timeIntervalSince1970: Double(expires_at))
+        return calendar.dateComponents([.day], from: calendar.startOfDay(for: Date()), to: calendar.startOfDay(for: date)).day
+    }
+    var updatedShortLabel: String {
+        if status == "stale" { return "历史数据" }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = fetched_at.flatMap({ formatter.date(from: $0) ?? ISO8601DateFormatter().date(from: $0) }) else { return "尚无数据" }
+        let output = DateFormatter()
+        output.dateFormat = "MM-dd HH:mm"
+        return output.string(from: date)
+    }
+}
+
+/// 设计稿的按钮样式：主按钮蓝底、次按钮白底描边、浅蓝强调、浅红断开、无边框图标。
+struct PanelButtonStyle: ButtonStyle {
+    enum Kind { case primary, secondary, tinted, danger, ghost }
+    var kind: Kind = .secondary
+    var height: CGFloat = 36
+    var radius: CGFloat = 10
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 12, weight: .medium))
-            .padding(.horizontal, 14).frame(height: 36)
-            .foregroundStyle(prominent ? Color.white : Color.primary)
-            .background(prominent ? tint : Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(prominent ? Color.clear : Color.primary.opacity(0.12)))
-            .overlay(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(configuration.isPressed ? 0.08 : 0)))
+        let large = kind == .primary || kind == .danger
+        let foreground: Color, background: Color, stroke: Color
+        switch kind {
+        case .primary: (foreground, background, stroke) = (.white, Palette.accent, .clear)
+        case .secondary: (foreground, background, stroke) = (Palette.text, Palette.surface, Palette.border)
+        case .tinted: (foreground, background, stroke) = (Palette.accentText, Palette.accentSoft, .clear)
+        case .danger: (foreground, background, stroke) = (Palette.danger, Palette.dangerSoft, Palette.dangerBorder)
+        case .ghost: (foreground, background, stroke) = (Palette.text2, .clear, .clear)
+        }
+        return configuration.label
+            .font(.system(size: large ? 14 : 12, weight: large || kind == .tinted ? .semibold : .medium))
+            .padding(.horizontal, kind == .ghost ? 8 : (large ? 18 : 13)).frame(height: height)
+            .foregroundStyle(foreground)
+            .background(background, in: RoundedRectangle(cornerRadius: radius))
+            .overlay(RoundedRectangle(cornerRadius: radius).strokeBorder(stroke))
+            .overlay(RoundedRectangle(cornerRadius: radius).fill(Color.primary.opacity(configuration.isPressed ? 0.08 : 0)))
+            .shadow(color: kind == .primary && isEnabled ? Palette.accent.opacity(0.28) : .clear, radius: 8, y: 4)
             .opacity(isEnabled ? 1 : 0.45)
-            .contentShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(RoundedRectangle(cornerRadius: radius))
+    }
+}
+
+/// 整块可点的卡片、列表行：只加按下反馈和禁用透明度。
+struct PressableStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(isEnabled ? (configuration.isPressed ? 0.8 : 1) : 0.55)
+    }
+}
+
+struct PulseDot: View {
+    var color: Color
+    var animate: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var expanded = false
+    var body: some View {
+        Circle().fill(color).frame(width: 7, height: 7)
+            .background(Circle().fill(color.opacity(expanded ? 0 : 0.45)).scaleEffect(expanded ? 2.8 : 1))
+            .onAppear {
+                guard animate && !reduceMotion else { return }
+                withAnimation(.easeOut(duration: 2).repeatForever(autoreverses: false)) { expanded = true }
+            }
     }
 }
 
@@ -717,36 +852,59 @@ struct SubscriptionRow: View {
         return "\(item.name)，\(state)，已用 \(used)，总量 \(total)，到期 \(expiry)\(history)"
     }
 
+    /// 头像配色按订阅 uid 固定，切换顺序不会变色。
+    private var avatarColors: (Color, Color) {
+        let options: [(Color, Color)] = [
+            (Palette.dynamic(0xE3EBFD, 0x1E2A44), Palette.dynamic(0x1D4ED8, 0x93B4FB)),
+            (Palette.dynamic(0xFDE9E2, 0x3A2018), Palette.dynamic(0xB93815, 0xF4A386)),
+            (Palette.dynamic(0xE3F6EC, 0x14301F), Palette.dynamic(0x067647, 0x6EE7A0)),
+            (Palette.dynamic(0xEFE8FD, 0x2A2140), Palette.dynamic(0x6D28D9, 0xC4B5FD))
+        ]
+        let sum = item.uid.unicodeScalars.reduce(0) { $0 + Int($1.value) }
+        return options[sum % options.count]
+    }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 4) {
+        HStack(spacing: 4) {
             Button(action: onSelect) {
-                VStack(alignment: .leading, spacing: 7) {
-                    HStack(spacing: 5) {
-                        Text(item.name).font(.system(size: 13, weight: selected ? .semibold : .medium))
-                            .lineLimit(2).multilineTextAlignment(.leading)
-                        if selected { Image(systemName: "checkmark.circle.fill").font(.system(size: 11)).foregroundStyle(.blue) }
+                HStack(spacing: 10) {
+                    Text(String(item.name.prefix(1))).font(.system(size: 14, weight: .semibold))
+                        .frame(width: 32, height: 32)
+                        .foregroundStyle(avatarColors.1)
+                        .background(avatarColors.0, in: RoundedRectangle(cornerRadius: 9))
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(item.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.text).lineLimit(1)
+                            if item.usage?.status == "stale" {
+                                Text("历史数据").font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.warning)
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(Palette.warningSoft, in: RoundedRectangle(cornerRadius: 5)).fixedSize()
+                            }
+                        }
+                        Text("\(item.usage?.usedLabel ?? "未提供") / \(item.usage?.totalLabel ?? "未提供")")
+                            .font(.system(size: 11, design: .monospaced)).foregroundStyle(Palette.text2).lineLimit(1)
                     }
-                    Text("\(item.usage?.usedLabel ?? "未提供") / \(item.usage?.totalLabel ?? "未提供")")
-                        .font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
-                    Text("到期：\(item.usage?.expiryLabel ?? "未提供期限")")
-                        .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
-                    if item.usage?.status == "stale" {
-                        Label("历史数据", systemImage: "clock.arrow.circlepath")
-                            .font(.system(size: 9, weight: .medium)).foregroundStyle(.orange)
+                    Spacer(minLength: 0)
+                    if selected {
+                        Image(systemName: "checkmark").font(.system(size: 8, weight: .heavy)).foregroundStyle(.white)
+                            .frame(width: 18, height: 18).background(Palette.accent, in: Circle())
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-            }.buttonStyle(.plain).disabled(!canSelect)
+                }.contentShape(Rectangle())
+            }.buttonStyle(PressableStyle()).disabled(!canSelect)
                 .help(item.name + "\n已用 / 总量；以服务商订阅返回值为准。")
                 .accessibilityLabel(accessibilitySummary)
-            Menu {
-                Button("删除订阅", role: .destructive, action: onDelete).disabled(!canDelete)
-                if connected { Text("停止连接后可删除当前订阅") }
-            } label: { Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)) }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 20, height: 20)
-                .help("管理「\(item.name)」").accessibilityLabel("管理订阅：\(item.name)")
-        }.padding(12)
-            .background(selected ? Color.blue.opacity(0.075) : (hovered ? Color.primary.opacity(0.035) : Color.clear), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(selected ? Color.blue.opacity(0.22) : Color.primary.opacity(0.065)))
+            if hovered {
+                Menu {
+                    Button("删除订阅", role: .destructive, action: onDelete).disabled(!canDelete)
+                    if connected { Text("停止连接后可删除当前订阅") }
+                } label: { Image(systemName: "ellipsis").font(.system(size: 12, weight: .semibold)) }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 20, height: 20)
+                    .help("管理「\(item.name)」").accessibilityLabel("管理订阅：\(item.name)")
+            }
+        }.padding(.horizontal, 10).padding(.vertical, 9)
+            .background(selected ? Palette.surface : (hovered ? Color.primary.opacity(0.04) : Color.clear), in: RoundedRectangle(cornerRadius: 10))
+            .shadow(color: selected ? .black.opacity(0.08) : .clear, radius: 2, y: 1)
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(selected ? Color.primary.opacity(0.06) : .clear))
             .onHover { hovered = $0 }
             .contextMenu {
                 Button("删除订阅", role: .destructive, action: onDelete).disabled(!canDelete)
@@ -808,12 +966,19 @@ struct NodeSelectorControl: NSViewRepresentable {
 }
 
 struct ContentView: View {
+    enum Filter: CaseIterable { case all, ok, soon, expired }
+    enum SortKey { case name, expiry }
+
     @ObservedObject var model: Model
     @Environment(\.scenePhase) private var scenePhase
     @State private var search = ""
+    @State private var filter: Filter = .all
+    @State private var sortKey: SortKey = .expiry
+    @State private var sortAscending = true
     @State private var adding = false
     @State private var editing: ExitProfile?
-    @State private var deleting = false
+    @State private var profileToDelete: ExitProfile?
+    @State private var purging = false
     @State private var confirming = false
     @State private var restoring = false
     @State private var addingSubscription = false
@@ -821,27 +986,67 @@ struct ContentView: View {
     @State private var migrating = false
     @State private var targetSubscription: Subscription?
     @State private var nodeSelectorHovered = false
+    @State private var languageTarget: Bool?
+    /// 关闭「使用静态 IP」前的选择，重新开启时优先恢复。
+    @State private var lastProfileID: String?
+
+    private var usingStatic: Bool { model.selected != nil }
+    private var locked: Bool { model.busy || !model.stateKnown || model.recoveryNeeded }
+
+    private func matches(_ profile: ExitProfile, _ filter: Filter) -> Bool {
+        switch filter {
+        case .all: return true
+        case .ok: return [.ok, .unknown].contains(profile.expiryStatus)
+        case .soon: return profile.expiryStatus == .soon
+        case .expired: return profile.expiryStatus == .expired
+        }
+    }
 
     private var filtered: [ExitProfile] {
-        model.profiles.filter { search.isEmpty || "\($0.name) \($0.server)".localizedCaseInsensitiveContains(search) }
+        model.profiles
+            .filter { matches($0, filter) }
+            .filter { search.isEmpty || "\($0.name) \($0.server)".localizedCaseInsensitiveContains(search) }
+            .sorted { a, b in
+                switch sortKey {
+                case .name:
+                    let order = a.name.localizedStandardCompare(b.name)
+                    return sortAscending ? order == .orderedAscending : order == .orderedDescending
+                case .expiry:
+                    // 未填写到期时间的排在最后。
+                    let left = a.daysLeft ?? Int.max, right = b.daysLeft ?? Int.max
+                    return sortAscending ? left < right : left > right
+                }
+            }
+    }
+
+    private func isConfigured(_ profile: ExitProfile) -> Bool {
+        profile.server == model.configuredServer && profile.port == model.configuredPort
+    }
+
+    /// 当前选择（静态 IP 与中转节点）是否与已保存配置一致。
+    private var selectionSaved: Bool {
+        let profileSaved = model.selectedProfile.map(isConfigured) ?? model.configuredServer.isEmpty
+        return profileSaved && model.relay == model.activeRelay
     }
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 234)
-            Divider()
-            VStack(spacing: 16) {
-                header
-                if !model.serviceReady { serviceNotice }
-                if model.recoveryNeeded || !model.serviceError.isEmpty { recoveryNotice }
-                exitCard
-                library
-                connectionBar
-            }.padding(22).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            sidebar.frame(width: 248)
+            Rectangle().fill(Palette.border).frame(width: 1)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    header
+                    if !model.serviceReady { serviceNotice }
+                    if model.recoveryNeeded || !model.serviceError.isEmpty { recoveryNotice }
+                    hero
+                    exitSettings
+                    library
+                }.padding(.horizontal, 28).padding(.top, 24).padding(.bottom, 30)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }.background(Palette.surface)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
-        .frame(minWidth: 960, minHeight: 720)
+        .foregroundStyle(Palette.text)
+        .frame(minWidth: 1000, minHeight: 720)
         .task { model.load(); model.checkForUpdates(manual: false) }
         .alert(item: $model.update) { info in
             Alert(title: Text("发现新版本 v\(info.latest)"),
@@ -855,12 +1060,6 @@ struct ContentView: View {
         .sheet(isPresented: $adding) { AddView(model: model) }
         .sheet(item: $editing) { profile in AddView(model: model, existing: profile) }
         .sheet(isPresented: $addingSubscription) { AddSubscriptionView(model: model) }
-        .alert("删除所选静态 IP？", isPresented: $deleting) {
-            Button("取消", role: .cancel) {}
-            Button("删除", role: .destructive) {
-                if let id = model.selected { model.call(["op": "delete", "id": id]) }
-            }
-        } message: { Text("删除本机记录和钥匙串密码。删除后，需重新添加才能再次选择这个出口。") }
         .alert(model.running ? "应用这个静态出口？" : "保存这个出口选择？", isPresented: $confirming) {
             Button("取消", role: .cancel) {}
             Button(model.running ? "验证并切换" : "保存选择") {
@@ -873,51 +1072,35 @@ struct ContentView: View {
             Button("取消", role: .cancel) {}
             Button("恢复") { model.call(["op": "restore"]) }
         } message: { Text("恢复上一次切换前的配置和出口。") }
-        .alert("切换机场订阅？", isPresented: Binding(get: { targetSubscription != nil }, set: { if !$0 { targetSubscription = nil } }), presenting: targetSubscription) { item in
-            Button("取消", role: .cancel) { targetSubscription = nil }
-            Button("切换") { selectSubscription(item); targetSubscription = nil }
-        } message: { item in Text("切换到「\(item.name)」，保留静态出口和国内直连规则。切换过程中可能短暂影响新建连接。") }
-        .alert("删除订阅？", isPresented: Binding(get: { subscriptionToDelete != nil }, set: { if !$0 { subscriptionToDelete = nil } }), presenting: subscriptionToDelete) { item in
-            Button("取消", role: .cancel) { subscriptionToDelete = nil }
-            Button("删除", role: .destructive) {
-                model.call(["op": "delete_subscription", "uid": item.uid]) { ok in if ok { model.load(verify: false) } }
-                subscriptionToDelete = nil
-            }.disabled(!canDeleteSubscription(item))
-        } message: { item in Text("删除本机保存的「\(item.name)」及其节点，不会取消服务商套餐。") }
-        .alert("从 Clash Verge 迁移配置？", isPresented: $migrating) {
-            Button("取消", role: .cancel) {}
-            Button("迁移到独立版") { model.call(["op": "migrate"]) { ok in if ok { model.load(verify: false) } } }
-        } message: { Text("一次性复制本机订阅和静态 IP。迁移后由独立版保存和管理，日常运行无需 Clash Verge。") }
     }
+
+    // MARK: - 侧栏
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: "network").font(.system(size: 22, weight: .medium)).foregroundStyle(.blue)
-                    .frame(width: 38, height: 38)
-                    .background(Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 4) {
+                Image(systemName: "globe").font(.system(size: 17, weight: .medium)).foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Palette.accent, in: RoundedRectangle(cornerRadius: 9))
+                    .shadow(color: Palette.accent.opacity(0.25), radius: 3, y: 2)
+                VStack(alignment: .leading, spacing: 1) {
                     Text("静态出口").font(.system(size: 15, weight: .semibold))
-                    Text("个人网络管理").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("个人网络管理").font(.system(size: 11)).foregroundStyle(Palette.text2)
                 }
-            }.padding(.horizontal, 16).padding(.top, 22).padding(.bottom, 24)
+            }.padding(.horizontal, 18).padding(.top, 20).padding(.bottom, 20)
             HStack(spacing: 6) {
-                Text("机场订阅").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-                Text("\(model.subscriptions.count)")
-                    .font(.system(size: 10, weight: .medium).monospacedDigit()).foregroundStyle(.secondary)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Color.primary.opacity(0.05), in: Capsule())
+                Text("机场订阅").font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.text2)
                 Spacer()
                 Menu {
                     Button("添加订阅链接") { addingSubscription = true }
                     Button("导入本地 YAML") { importSubscription() }
                 } label: { Image(systemName: "plus").font(.system(size: 13, weight: .medium)) }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24, height: 24)
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 26, height: 26)
                     .help("添加机场订阅").accessibilityLabel("添加机场订阅").disabled(model.busy)
-            }.padding(.horizontal, 16).padding(.bottom, 10)
+            }.padding(.leading, 20).padding(.trailing, 14).padding(.bottom, 4)
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    VStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(spacing: 2) {
                         ForEach(model.subscriptions) { item in
                             SubscriptionRow(item: item, selected: item.uid == model.subscriptionUID,
                                             canSelect: !model.busy && model.stateKnown && !model.recoveryNeeded,
@@ -932,365 +1115,622 @@ struct ContentView: View {
                     }
                     if model.subscriptions.isEmpty {
                         VStack(spacing: 12) {
-                            Image(systemName: "server.rack").font(.system(size: 24)).foregroundStyle(.secondary)
+                            Image(systemName: "server.rack").font(.system(size: 24)).foregroundStyle(Palette.text3)
                             Text("还没有机场订阅").font(.callout)
-                            Button("添加订阅") { addingSubscription = true }
+                            Button("添加订阅") { addingSubscription = true }.buttonStyle(PanelButtonStyle(kind: .tinted))
                             Button("导入 YAML") { importSubscription() }.buttonStyle(.link)
                         }.frame(maxWidth: .infinity).padding(.vertical, 20).disabled(model.busy)
                     }
-                    if !model.subscriptionUID.isEmpty { subscriptionUsageCard }
+                    if !model.subscriptionUID.isEmpty { planCard }
                     if !model.migrated && model.subscriptions.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("已有 Clash Verge 配置？").font(.caption.weight(.medium))
-                            Text("首次使用可复制订阅与静态 IP，之后独立管理。").font(.system(size: 11)).foregroundStyle(.secondary)
-                            Button("迁移已有配置") { migrating = true }.controlSize(.small).disabled(model.busy)
-                        }.padding(12).background(Color.blue.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
+                            Text("已有 Clash Verge 配置？").font(.system(size: 12, weight: .semibold))
+                            Text("首次使用可复制订阅与静态 IP，之后独立管理。").font(.system(size: 11)).foregroundStyle(Palette.text2)
+                            Button("迁移已有配置") { migrating = true }.buttonStyle(PanelButtonStyle(kind: .secondary, height: 32)).disabled(model.busy)
+                        }.padding(12).background(Palette.accentSoft, in: RoundedRectangle(cornerRadius: 12))
                     }
-                }.padding(.horizontal, 12).padding(.bottom, 16)
+                }.padding(.horizontal, 12).padding(.vertical, 6)
             }
-            Divider().padding(.horizontal, 16)
-            Button { restoring = true } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "arrow.uturn.backward")
-                    Text("恢复上次配置")
-                    Spacer()
-                }.font(.system(size: 11)).padding(12).contentShape(Rectangle())
-            }.buttonStyle(.plain).disabled(model.busy || !model.hasBackup)
-                .padding(.horizontal, 4).padding(.vertical, 8)
-        }.frame(maxHeight: .infinity).background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+            sidebarFooter
+        }.frame(maxHeight: .infinity).background(Palette.sidebar)
+            .alert("切换机场订阅？", isPresented: Binding(get: { targetSubscription != nil }, set: { if !$0 { targetSubscription = nil } }), presenting: targetSubscription) { item in
+                Button("取消", role: .cancel) { targetSubscription = nil }
+                Button("切换") { selectSubscription(item); targetSubscription = nil }
+            } message: { item in Text("切换到「\(item.name)」，保留静态出口和国内直连规则。切换过程中可能短暂影响新建连接。") }
+            .alert("删除订阅？", isPresented: Binding(get: { subscriptionToDelete != nil }, set: { if !$0 { subscriptionToDelete = nil } }), presenting: subscriptionToDelete) { item in
+                Button("取消", role: .cancel) { subscriptionToDelete = nil }
+                Button("删除", role: .destructive) {
+                    model.call(["op": "delete_subscription", "uid": item.uid]) { ok in if ok { model.load(verify: false) } }
+                    subscriptionToDelete = nil
+                }.disabled(!canDeleteSubscription(item))
+            } message: { item in Text("删除本机保存的「\(item.name)」及其节点，不会取消服务商套餐。") }
+            .alert("从 Clash Verge 迁移配置？", isPresented: $migrating) {
+                Button("取消", role: .cancel) {}
+                Button("迁移到独立版") { model.call(["op": "migrate"]) { ok in if ok { model.load(verify: false) } } }
+            } message: { Text("一次性复制本机订阅和静态 IP。迁移后由独立版保存和管理，日常运行无需 Clash Verge。") }
     }
 
-    private var subscriptionUsageCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    private var planCard: some View {
+        let usage = model.currentUsage
+        return VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 6) {
-                Text("当前套餐").font(.system(size: 11, weight: .semibold))
-                if model.currentUsage?.status == "stale" {
-                    Text("历史数据").font(.system(size: 9, weight: .medium)).foregroundStyle(.orange)
-                }
-                Spacer(minLength: 3)
+                Text("当前套餐 · \(model.selectedSubscription?.name ?? "")").font(.system(size: 12, weight: .semibold)).lineLimit(1)
+                Spacer(minLength: 4)
                 Button { model.refreshSubscriptionUsage() } label: {
-                    Image(systemName: "arrow.clockwise").font(.system(size: 12))
-                        .frame(width: 24, height: 24).contentShape(Rectangle())
-                }.buttonStyle(.borderless).disabled(model.busy)
-                    .help("刷新用量").accessibilityLabel("刷新用量")
+                    Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .medium)).frame(width: 28, height: 28).contentShape(Rectangle())
+                }.buttonStyle(.plain).foregroundStyle(Palette.text2).disabled(model.busy)
+                    .help("刷新用量").accessibilityLabel("刷新套餐用量")
             }
-            HStack(alignment: .top, spacing: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("已用流量").font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text(model.currentUsage?.usedLabel ?? "未提供")
-                        .font(.system(size: 16, weight: .semibold).monospacedDigit()).lineLimit(1).minimumScaleFactor(0.8)
-                }
-                Spacer(minLength: 0)
-                VStack(alignment: .trailing, spacing: 6) {
-                    Text("套餐总量").font(.system(size: 10)).foregroundStyle(.secondary)
-                    Text(model.currentUsage?.totalLabel ?? "未提供")
-                        .font(.system(size: 14, weight: .medium).monospacedDigit()).lineLimit(1).minimumScaleFactor(0.8)
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle().stroke(Palette.divider, lineWidth: 7)
+                    Circle().trim(from: 0, to: usage?.fraction ?? 0)
+                        .stroke((usage?.fraction ?? 0) >= 0.9 ? Palette.warning : Palette.accent, style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Text(usage?.fraction.map { "\(Int(($0 * 100).rounded()))%" } ?? "—")
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                }.frame(width: 60, height: 60)
+                    .accessibilityElement(children: .ignore).accessibilityLabel("套餐用量比例")
+                    .accessibilityValue(usage?.fraction.map { "\(Int($0 * 100))%" } ?? "未提供")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("已用流量").font(.system(size: 11)).foregroundStyle(Palette.text2)
+                    Text(usage?.usedLabel ?? "未提供").font(.system(size: 17, weight: .semibold, design: .monospaced))
+                        .lineLimit(1).minimumScaleFactor(0.7)
+                    Text("共 \(usage?.totalLabel ?? "未提供")").font(.system(size: 11, design: .monospaced)).foregroundStyle(Palette.text2)
+                        .lineLimit(1).minimumScaleFactor(0.8)
                 }
             }
-            if let value = model.currentUsage?.fraction {
-                GeometryReader { geometry in
-                    ZStack(alignment: .leading) {
-                        Capsule().fill(Color.primary.opacity(0.07))
-                        Capsule().fill(value >= 0.9 ? Color.orange : Color.blue)
-                            .frame(width: geometry.size.width * value)
+            VStack(spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("到期").foregroundStyle(Palette.text2)
+                    Spacer(minLength: 4)
+                    Text(usage?.expiryLabel ?? "未提供期限").font(.system(size: 11, design: .monospaced))
+                        .help(usage?.fullExpiryLabel ?? "服务商未提供期限")
+                    if let days = usage?.daysLeft, days >= 0 {
+                        Text("· 剩 \(days) 天").fontWeight(.medium).foregroundStyle(Palette.success)
                     }
-                }.frame(height: 4)
-                    .accessibilityLabel("套餐用量比例")
-                    .accessibilityValue("\(Int(value * 100))%")
-            }
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "calendar").foregroundStyle(.secondary)
-                Text("到期").foregroundStyle(.secondary)
-                Spacer(minLength: 2)
-                Text(model.currentUsage?.expiryLabel ?? "未提供期限")
-                    .multilineTextAlignment(.trailing).fixedSize(horizontal: false, vertical: true)
-                    .help(model.currentUsage?.fullExpiryLabel ?? "服务商未提供期限")
-            }.font(.system(size: 10))
-            Text(model.currentUsage?.snapshotLabel ?? "尚无用量数据")
-                .font(.system(size: 9)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if let reason = model.currentUsage?.reason, !reason.isEmpty {
-                Text(reason).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            if !model.usageMessage.isEmpty {
-                Text(model.usageMessage).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            Divider()
+                }
+                HStack(spacing: 6) {
+                    Text("更新").foregroundStyle(Palette.text2)
+                    Spacer(minLength: 4)
+                    Text(usage?.updatedShortLabel ?? "尚无数据").font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(usage?.status == "stale" ? Palette.warning : Palette.text)
+                        .help(usage?.snapshotLabel ?? "尚无用量数据")
+                }
+                ForEach([usage?.reason ?? "", model.usageMessage].filter { !$0.isEmpty }, id: \.self) { note in
+                    Text(note).foregroundStyle(Palette.text2).frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }.font(.system(size: 11)).padding(.top, 12)
+                .overlay(alignment: .top) { Rectangle().fill(Palette.divider).frame(height: 1) }
             Button {
                 model.call(["op": "update_subscription", "uid": model.subscriptionUID]) { ok in if ok { model.load(verify: false) } }
             } label: {
                 Label("更新节点", systemImage: "arrow.triangle.2.circlepath").frame(maxWidth: .infinity)
-            }.buttonStyle(ConnectionButtonStyle()).disabled(model.busy)
+            }.buttonStyle(PanelButtonStyle(kind: .secondary, height: 38)).disabled(model.busy)
         }.padding(14)
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+            .background(Palette.surface, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.primary.opacity(0.06)))
+            .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
     }
 
+    private var sidebarFooter: some View {
+        let status = model.busy ? model.activity : (model.message.isEmpty ? "就绪 · 数据仅存本机" : model.message)
+        return VStack(alignment: .leading, spacing: 6) {
+            Button { restoring = true } label: {
+                Label("恢复上次配置", systemImage: "arrow.uturn.backward").frame(maxWidth: .infinity, alignment: .leading)
+            }.buttonStyle(PanelButtonStyle(kind: .ghost, height: 34)).disabled(model.busy || !model.hasBackup)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if model.busy { ProgressView().controlSize(.mini) }
+                else { Circle().fill(model.error ? Palette.warning : Palette.successDot).frame(width: 6, height: 6) }
+                Text(status).foregroundStyle(model.error ? Palette.warning : Palette.text2)
+                    .lineLimit(4).textSelection(.enabled).help(status)
+                Spacer(minLength: 4)
+                Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")")
+                    .font(.system(size: 11, design: .monospaced)).foregroundStyle(Palette.text3)
+            }.font(.system(size: 11)).padding(.horizontal, 8)
+        }.padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 14)
+            .overlay(alignment: .top) { Rectangle().fill(Palette.border).frame(height: 1) }
+    }
+
+    // MARK: - 主区
+
     private var header: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("连接概览").font(.system(size: 22, weight: .bold))
-                Text("国内直连 · 国外 TCP 使用静态出口").font(.system(size: 12)).foregroundStyle(.secondary)
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("连接概览").font(.system(size: 22, weight: .semibold))
+                Text(usingStatic ? (model.globalStatic ? "全部公网流量使用静态出口" : "国内直连 · 国外 TCP 使用静态出口") : "国内直连 · 国外经中转节点")
+                    .font(.system(size: 13)).foregroundStyle(Palette.text2)
             }
             Spacer()
-            Button { model.load() } label: { Label("刷新", systemImage: "arrow.clockwise") }.disabled(model.busy)
+            Button { model.load() } label: { Label("刷新", systemImage: "arrow.clockwise") }
+                .buttonStyle(PanelButtonStyle(kind: .secondary, height: 38)).disabled(model.busy)
             Menu {
                 Button("检查更新…") { model.checkForUpdates(manual: true) }.disabled(model.busy)
                 if model.serviceReady {
                     Button("重新安装网络服务") { model.registerService() }.disabled(model.running || !model.stateKnown || model.busy)
                 }
-            } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).fixedSize()
-                .help("检查更新与网络服务")
+            } label: {
+                Image(systemName: "slider.horizontal.3").font(.system(size: 14, weight: .medium))
+                    .frame(width: 44, height: 38).contentShape(Rectangle())
+            }.menuStyle(.borderlessButton).fixedSize()
+                .background(Palette.surface, in: RoundedRectangle(cornerRadius: 10))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Palette.border))
+                .help("检查更新与网络服务").accessibilityLabel("设置")
         }
+    }
+
+    private func notice(icon: String, title: String, detail: [String], action: String, perform: @escaping () -> Void) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: icon).font(.title2).foregroundStyle(Palette.warning)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                ForEach(detail.filter { !$0.isEmpty }, id: \.self) { line in
+                    Text(line).font(.system(size: 12)).foregroundStyle(Palette.text2).textSelection(.enabled)
+                }
+            }
+            Spacer(minLength: 5)
+            Button(action, action: perform).buttonStyle(PanelButtonStyle(kind: .secondary, height: 34)).disabled(model.busy)
+        }.padding(14).background(Palette.warningSoft, in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var serviceNotice: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: "lock.shield").font(.title2).foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(model.serviceLabel).font(.system(size: 12, weight: .semibold))
-                Text("安装时需要输入一次管理员密码；订阅和静态 IP 可以先离线管理。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 5)
-            Button("安装网络服务") { model.registerService() }.disabled(model.busy)
-        }.padding(14).background(Color.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        notice(icon: "lock.shield", title: model.serviceLabel,
+               detail: ["安装时需要输入一次管理员密码；订阅和静态 IP 可以先离线管理。"],
+               action: "安装网络服务") { model.registerService() }
     }
 
     private var recoveryNotice: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "exclamationmark.shield").font(.title2).foregroundStyle(.orange)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(model.recoveryNeeded ? "上次配置操作尚未恢复完成" : "网络服务状态需要确认")
-                    .font(.system(size: 12, weight: .semibold))
-                if !model.serviceError.isEmpty { Text(model.serviceError).font(.system(size: 11)).textSelection(.enabled) }
-                Text(model.recoveryNeeded ? "请先停止连接，确认服务停止后再选择出口或恢复配置。" : "未确认服务停止前，暂停切换订阅和启动新连接；你仍可尝试停止连接。")
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 5)
-            Button("停止连接") { model.call(["op": "stop"]) { ok in if ok { model.load(verify: false) } } }.disabled(model.busy)
-        }.padding(14).background(Color.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+        notice(icon: "exclamationmark.shield",
+               title: model.recoveryNeeded ? "上次配置操作尚未恢复完成" : "网络服务状态需要确认",
+               detail: [model.serviceError, model.recoveryNeeded ? "请先停止连接，确认服务停止后再选择出口或恢复配置。" : "未确认服务停止前，暂停切换订阅和启动新连接；你仍可尝试停止连接。"],
+               action: "停止连接") { model.call(["op": "stop"]) { ok in if ok { model.load(verify: false) } } }
     }
 
-    private var exitCard: some View {
-        HStack(alignment: .center, spacing: 16) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14).fill(Color.blue.opacity(0.09)).frame(width: 52, height: 52)
-                Image(systemName: "globe").font(.system(size: 26, weight: .light)).foregroundStyle(.blue)
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 8) {
-                    Text("当前公网出口").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
-                    if model.checking { ProgressView().controlSize(.mini) }
-                }
-                HStack(spacing: 10) {
-                    Text(model.exitIP.isEmpty ? (!model.stateKnown ? "状态待确认" : (model.running ? "等待检测" : "尚未连接")) : model.exitIP)
-                        .font(.system(size: model.exitIP.isEmpty ? 23 : 29, weight: .semibold, design: .monospaced))
-                        .textSelection(.enabled).lineLimit(1).minimumScaleFactor(0.8)
-                    if !model.exitIP.isEmpty {
-                        Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(model.exitIP, forType: .string) } label: { Image(systemName: "doc.on.doc") }
-                            .buttonStyle(.borderless).help("复制出口 IP").accessibilityLabel("复制出口 IP")
+    private var statusBadge: (String, Color, Color, Color) {
+        if !model.stateKnown { return ("状态未知", Palette.warningSoft, Palette.warning, Palette.warning) }
+        if model.connectionVerified { return ("已连接", Palette.successSoft, Palette.success, Palette.successDot) }
+        if model.running { return ("待验证", Palette.warningSoft, Palette.warning, Palette.warning) }
+        return ("未连接", Palette.chip, Palette.text2, Palette.idle)
+    }
+
+    private var hero: some View {
+        let badge = statusBadge
+        let hasIP = !model.exitIP.isEmpty
+        return VStack(alignment: .leading, spacing: 20) {
+            HStack(alignment: .bottom, spacing: 20) {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 8) {
+                        PulseDot(color: badge.3, animate: model.connectionVerified).id(model.connectionVerified)
+                        Text(badge.0).font(.system(size: 12, weight: .semibold))
+                    }.foregroundStyle(badge.2).padding(.horizontal, 11).frame(height: 26)
+                        .background(badge.1, in: Capsule())
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("当前公网出口").font(.system(size: 13)).foregroundStyle(Palette.text3)
+                            if model.checking { ProgressView().controlSize(.mini) }
+                        }
+                        HStack(spacing: 10) {
+                            Text(hasIP ? model.exitIP : (!model.stateKnown ? "状态待确认" : (model.running ? "等待检测" : "尚未连接")))
+                                .font(.system(size: 36, weight: hasIP ? .medium : .semibold, design: hasIP ? .monospaced : .default))
+                                .textSelection(.enabled).lineLimit(1).minimumScaleFactor(0.7)
+                            if hasIP {
+                                Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(model.exitIP, forType: .string) } label: {
+                                    Image(systemName: "doc.on.doc").frame(width: 28, height: 28).contentShape(Rectangle())
+                                }.buttonStyle(.plain).foregroundStyle(Palette.text3).help("复制出口 IP").accessibilityLabel("复制出口 IP")
+                            }
+                        }
+                        heroDetail
                     }
                 }
-                if !model.exitIP.isEmpty {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Image(systemName: "mappin.and.ellipse").foregroundStyle(.blue.opacity(0.8))
-                        Text(model.loadingExitLocation ? "正在查询地点…" : (model.exitLocation?.label ?? "地点暂不可用"))
-                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        if model.exitLocation?.status == "stale" {
-                            Text("历史缓存").font(.system(size: 10)).foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                HStack(spacing: 10) {
+                    if model.running && model.stateKnown {
+                        Button("重新检测") { model.call(["op": "verify"]) }
+                            .buttonStyle(PanelButtonStyle(kind: .ghost, height: 44)).disabled(model.busy)
+                    }
+                    if !model.relay.isEmpty {
+                        if selectionSaved {
+                            Label("已保存为默认", systemImage: "checkmark").font(.system(size: 13)).foregroundStyle(Palette.text2)
+                                .labelStyle(SavedLabelStyle()).padding(.horizontal, 6)
+                        } else {
+                            Button { confirming = true } label: {
+                                Label(model.running ? "应用所选出口" : "保存选择", systemImage: "bookmark")
+                            }.buttonStyle(PanelButtonStyle(kind: .secondary, height: 44, radius: 12))
+                                .disabled(model.busy || !model.stateKnown || model.recoveryNeeded)
                         }
                     }
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                    if model.shouldOfferStop {
+                        Button { model.call(["op": "stop"]) { ok in if ok { model.load(verify: false) } } } label: {
+                            Label("断开连接", systemImage: "power").frame(minWidth: 96)
+                        }.buttonStyle(PanelButtonStyle(kind: .danger, height: 44, radius: 12)).disabled(model.busy)
+                    } else {
+                        Button { model.call(["op": "start", "id": model.selected ?? "", "relay": model.relay]) } label: {
+                            Label("开始连接", systemImage: "power").frame(minWidth: 96)
+                        }.buttonStyle(PanelButtonStyle(kind: .primary, height: 44, radius: 12))
+                            .disabled(model.busy || model.relay.isEmpty || model.subscriptionUID.isEmpty || !model.serviceReady || !model.stateKnown || model.recoveryNeeded)
+                    }
+                }
+            }
+            nodeSelector
+        }.padding(.horizontal, 26).padding(.vertical, 24)
+            .background(alignment: .topTrailing) { heroGlobe.offset(x: 96, y: -124) }
+            .background(Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Palette.border))
+            .shadow(color: .black.opacity(0.07), radius: 16, y: 8)
+    }
+
+    @ViewBuilder private var heroDetail: some View {
+        if model.exitIP.isEmpty {
+            Text(model.checking ? "正在通过当前线路检测…" : (!model.stateKnown ? "无法确认连接状态，请刷新或停止连接" : (model.running ? "检测后显示实际公网出口" : "选择订阅与中转节点（静态 IP 可选），然后开始连接")))
+                .font(.system(size: 13)).foregroundStyle(Palette.text2)
+        } else {
+            HStack(spacing: 6) {
+                Image(systemName: "mappin.and.ellipse").foregroundStyle(Palette.accent)
+                Text(model.loadingExitLocation ? "正在查询地点…" : (model.exitLocation?.label ?? "地点暂不可用"))
+                    .textSelection(.enabled)
                     .help(model.exitLocation?.help ?? "连接验证后单独查询 IP 归属地，查询失败不影响网络连接。")
-                }
-                if let at = model.verifiedAt {
-                    Text("已实测 · \(at.formatted(date: .omitted, time: .standard))").font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text(model.checking ? "正在通过当前线路检测…" : (!model.stateKnown ? "无法确认连接状态，请刷新或停止连接" : (model.running ? "检测后显示实际公网出口" : "选择订阅与中转节点（静态 IP 可选），然后开始连接")))
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                if model.exitLocation?.status == "stale" { Text("历史缓存").foregroundStyle(Palette.text3) }
+                if let at = model.verifiedAt { Text("· 已实测 \(at.formatted(date: .omitted, time: .standard))").foregroundStyle(Palette.text3) }
+            }.font(.system(size: 13)).foregroundStyle(Palette.text2)
+        }
+    }
+
+    private var heroGlobe: some View {
+        Canvas { context, size in
+            let rect = CGRect(origin: .zero, size: size).insetBy(dx: 20, dy: 20)
+            let shading = GraphicsContext.Shading.color(Palette.accent)
+            context.stroke(Path(ellipseIn: rect), with: shading, lineWidth: 1)
+            for width in [rect.width * 0.4, rect.width * 0.75] {
+                context.stroke(Path(ellipseIn: CGRect(x: rect.midX - width / 2, y: rect.minY, width: width, height: rect.height)), with: shading, lineWidth: 1)
             }
-            Spacer(minLength: 0)
-            VStack(alignment: .trailing, spacing: 10) {
-                Pill(title: !model.stateKnown ? "状态未知" : (model.connectionVerified ? "已验证连接" : (model.running ? "待验证" : "未连接")), symbol: !model.stateKnown ? "exclamationmark.triangle" : (model.connectionVerified ? "checkmark.shield" : "pause.circle"), color: model.connectionVerified ? .green : (model.running || !model.stateKnown ? .orange : .secondary))
-                if model.running && model.stateKnown {
-                    Button("重新检测") { model.call(["op": "verify"]) }.controlSize(.small).disabled(model.busy)
-                }
+            var lines = Path()
+            lines.move(to: CGPoint(x: rect.midX, y: rect.minY)); lines.addLine(to: CGPoint(x: rect.midX, y: rect.maxY))
+            lines.move(to: CGPoint(x: rect.minX, y: rect.midY)); lines.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+            for y in [rect.minY + rect.height * 0.25, rect.minY + rect.height * 0.75] {
+                let half = rect.width / 2 * 0.866
+                lines.move(to: CGPoint(x: rect.midX - half, y: y)); lines.addLine(to: CGPoint(x: rect.midX + half, y: y))
             }
-        }.padding(20).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.primary.opacity(0.07)))
+            context.stroke(lines, with: shading, lineWidth: 1)
+        }.frame(width: 400, height: 400).opacity(0.09).allowsHitTesting(false).accessibilityHidden(true)
+    }
+
+    /// 中转节点独占一行，完整显示节点名；右侧测当前节点或全部节点延迟。
+    private var nodeSelector: some View {
+        let delay = model.nodeDelays[model.relay]
+        let testable = !model.busy && !model.subscriptionUID.isEmpty && !model.nodes.isEmpty && model.stateKnown && !model.recoveryNeeded
+        return HStack(spacing: 10) {
+            ZStack {
+                HStack(spacing: 12) {
+                    Image(systemName: "server.rack").font(.system(size: 15)).foregroundStyle(Palette.accent)
+                        .frame(width: 34, height: 34).background(Palette.accentSoft, in: RoundedRectangle(cornerRadius: 9))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("中转节点 · 点击切换").font(.system(size: 11)).foregroundStyle(Palette.text3)
+                        Text(model.relay.isEmpty ? "请选择订阅和节点" : model.relay)
+                            .font(.system(size: 14, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer(minLength: 8)
+                    if !model.relay.isEmpty {
+                        Label(model.nodeDelayLabel(model.relay), systemImage: "waveform.path.ecg")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundStyle(delay?.status == "ok" ? Palette.success : Palette.text3)
+                            .padding(.horizontal, 9).padding(.vertical, 4)
+                            .background(delay?.status == "ok" ? Palette.successSoft : Palette.chip, in: Capsule()).fixedSize()
+                    }
+                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(Palette.text3)
+                }.padding(.horizontal, 10).frame(height: 54)
+                    .background(Palette.surface, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(nodeSelectorHovered && !model.busy ? Palette.accent.opacity(0.6) : Palette.border))
+                    .accessibilityHidden(true)
+                NodeSelectorControl(names: model.nodes,
+                                    titles: model.nodes.map { "\($0)  ·  \(model.nodeDelayLabel($0))" },
+                                    selection: $model.relay,
+                                    enabled: !model.busy && !model.nodes.isEmpty,
+                                    onChoose: { model.chooseRelay($0) })
+            }.frame(height: 54)
+                .onHover { nodeSelectorHovered = $0 }
+                .opacity(model.busy || model.nodes.isEmpty ? 0.5 : 1)
+                .help(model.relay.isEmpty ? "先选择机场订阅，再选择中转节点" : model.relay + "\n" + model.nodeDelayHelp(model.relay))
+            if !model.latencyProgress.isEmpty {
+                ProgressView().controlSize(.small)
+                Text(model.latencyProgress).font(.system(size: 12).monospacedDigit()).foregroundStyle(Palette.text2).fixedSize()
+                Button("取消测速") { model.cancelLatencyTest() }.buttonStyle(PanelButtonStyle(kind: .secondary, height: 40))
+            } else {
+                Button { model.testNodeLatencies(onlySelected: true) } label: { Label("测当前节点", systemImage: "speedometer") }
+                    .buttonStyle(PanelButtonStyle(kind: .secondary, height: 40)).disabled(!testable || model.relay.isEmpty)
+                Button { model.testNodeLatencies() } label: { Label("测全部节点", systemImage: "arrow.clockwise") }
+                    .buttonStyle(PanelButtonStyle(kind: .tinted, height: 40)).disabled(!testable)
+                    .help("测速全部节点；应用打开期间每 10 分钟也会自动测速。")
+            }
+        }
+    }
+
+    // MARK: - 静态 IP 库
+
+    private func count(_ filter: Filter) -> Int { model.profiles.filter { matches($0, filter) }.count }
+    private var expiredIDs: [String] {
+        model.profiles.filter { $0.expiryStatus == .expired && !isConfigured($0) && $0.id != model.selected }.map(\.id)
     }
 
     private var library: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text("静态 IP 库").font(.headline)
-                Text("\(model.profiles.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 8) {
+                Text("静态 IP 库").font(.system(size: 17, weight: .semibold))
+                Text("\(model.profiles.count)").font(.system(size: 12, weight: .medium, design: .monospaced)).foregroundStyle(Palette.text2)
+                    .padding(.horizontal, 8).padding(.vertical, 1).background(Palette.chip, in: Capsule())
                 Spacer()
                 Button { importCSV() } label: { Label("导入 CSV", systemImage: "square.and.arrow.down") }
+                    .buttonStyle(PanelButtonStyle(kind: .secondary, height: 38))
                 Button { adding = true } label: { Label("添加", systemImage: "plus") }
-            }.disabled(model.busy).padding(14)
-            Divider()
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("搜索名称或 IP 地址", text: $search).textFieldStyle(.plain)
-                if !search.isEmpty {
-                    Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary)
-                }
-            }.padding(.horizontal, 14).padding(.vertical, 10)
-            Divider()
+                    .buttonStyle(PanelButtonStyle(kind: .tinted, height: 38))
+            }.disabled(model.busy)
             if model.profiles.isEmpty {
                 VStack(spacing: 10) {
-                    Image(systemName: "externaldrive.badge.plus").font(.system(size: 28, weight: .light)).foregroundStyle(.secondary)
+                    Image(systemName: "externaldrive.badge.plus").font(.system(size: 28, weight: .light)).foregroundStyle(Palette.text3)
                     Text("还没有保存的静态 IP").font(.headline)
-                    Text("导入服务商 CSV，或添加代理地址和账号。").font(.caption).foregroundStyle(.secondary)
-                    Button("导入 CSV") { importCSV() }.disabled(model.busy)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(20)
+                    Text("导入服务商 CSV，或添加代理地址和账号。也可以不用静态 IP，仅通过中转节点连接。").font(.caption).foregroundStyle(Palette.text2)
+                    Button("导入 CSV") { importCSV() }.buttonStyle(PanelButtonStyle(kind: .tinted)).disabled(model.busy)
+                }.frame(maxWidth: .infinity).padding(28)
+                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Palette.border))
             } else {
-                Table(filtered, selection: Binding(get: { model.selected }, set: { value in
-                    model.selected = value
-                    model.chooseProfile(value)
-                })) {
-                    TableColumn("名称") { profile in
-                        HStack(spacing: 7) {
-                            Image(systemName: "externaldrive").foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(profile.name).fontWeight(.medium)
-                                if profile.server == model.configuredServer && profile.port == model.configuredPort {
-                                    Text(model.running ? "当前出口" : "已保存选择").font(.system(size: 10, weight: .medium)).foregroundStyle(.blue)
-                                }
-                            }
-                        }.help(profile.name)
-                    }.width(min: 105, ideal: 145)
-                    TableColumn("代理地址") { profile in Text(profile.address).font(.system(size: 12, design: .monospaced)).textSelection(.enabled) }.width(min: 155, ideal: 170)
-                    TableColumn("协议") { profile in Text(profile.protocol.uppercased()).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary) }.width(65)
-                    TableColumn("到期时间") { profile in Text(profile.expiryLabel).font(.system(size: 11)).foregroundStyle(.secondary) }.width(min: 78, ideal: 88)
-                }.tableStyle(.inset).alternatingRowBackgrounds(.disabled)
-                    .overlay {
-                        if filtered.isEmpty {
-                            VStack(spacing: 7) {
-                                Image(systemName: "magnifyingglass").font(.title2)
-                                Text("没有匹配的静态 IP").font(.callout)
-                                Text("试试其他名称或地址").font(.caption)
-                            }.foregroundStyle(.secondary).allowsHitTesting(false)
-                        }
+                HStack(spacing: 10) {
+                    HStack(spacing: 6) {
+                        ForEach(Filter.allCases, id: \.self) { item in filterChip(item) }
                     }
-                    .contextMenu {
-                        Button("编辑") { editing = model.selectedProfile }.disabled(model.selected == nil)
-                        Button("删除", role: .destructive) { deleting = true }.disabled(model.selected == nil)
-                    }.disabled(model.busy)
-            }
-            Divider()
-            HStack {
-                Text(model.selectedProfile.map { "已选：\($0.name)" } ?? "未选择静态 IP：国外流量以中转节点为出口").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                Spacer()
-                Button("不使用静态 IP") {
-                    model.selected = nil
-                    model.chooseProfile(nil)
-                }.help("取消选择，仅通过中转节点连接")
-                Button("编辑") { editing = model.selectedProfile }
-                Button("删除") { deleting = true }
-            }.controlSize(.small).disabled(model.selected == nil || model.busy).padding(.horizontal, 14).padding(.vertical, 9)
-        }.frame(minHeight: 220, maxHeight: .infinity)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
-    }
-
-    private var connectionBar: some View {
-        VStack(spacing: 12) {
-            nodeSelector
-            HStack(spacing: 8) {
-                if !model.latencyProgress.isEmpty {
-                    ProgressView().controlSize(.mini)
-                    Text(model.latencyProgress).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Button("取消测速") { model.cancelLatencyTest() }
-                        .buttonStyle(ConnectionButtonStyle())
-                } else {
+                    Spacer(minLength: 8)
                     HStack(spacing: 8) {
-                        Button { model.testNodeLatencies(onlySelected: true) } label: {
-                            Label("测当前节点", systemImage: "speedometer")
+                        Image(systemName: "magnifyingglass").foregroundStyle(Palette.text3)
+                        TextField("搜索名称或 IP", text: $search).textFieldStyle(.plain).font(.system(size: 13))
+                        if !search.isEmpty {
+                            Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }
+                                .buttonStyle(.plain).foregroundStyle(Palette.text3).accessibilityLabel("清除搜索")
                         }
-                        Button { model.testNodeLatencies() } label: {
-                            Label("立即刷新", systemImage: "arrow.clockwise")
-                        }.help("立即测速全部节点；应用打开期间每 10 分钟也会自动测速。")
-                    }.buttonStyle(ConnectionButtonStyle())
-                        .disabled(model.busy || model.subscriptionUID.isEmpty || model.nodes.isEmpty || !model.stateKnown || model.recoveryNeeded)
+                    }.padding(.horizontal, 12).frame(width: 220, height: 36)
+                        .background(Palette.chip, in: RoundedRectangle(cornerRadius: 10))
                 }
-                Spacer(minLength: 12)
-                HStack(spacing: 8) {
-                    Button(model.running ? "应用所选出口" : "保存选择") { confirming = true }
-                        .buttonStyle(ConnectionButtonStyle())
-                        .disabled(model.relay.isEmpty || !model.stateKnown || model.recoveryNeeded)
-                    if model.shouldOfferStop {
-                        Button {
-                            model.call(["op": "stop"]) { ok in if ok { model.load(verify: false) } }
-                        } label: {
-                            Label("停止连接", systemImage: "stop.fill").frame(minWidth: 80)
-                        }.buttonStyle(ConnectionButtonStyle(prominent: true, tint: .orange))
-                    } else {
-                        Button {
-                            model.call(["op": "start", "id": model.selected ?? "", "relay": model.relay])
-                        } label: {
-                            Label("开始连接", systemImage: "power").frame(minWidth: 80)
-                        }.buttonStyle(ConnectionButtonStyle(prominent: true))
-                            .disabled(model.relay.isEmpty || model.subscriptionUID.isEmpty || !model.serviceReady || !model.stateKnown || model.recoveryNeeded)
-                    }
-                }.disabled(model.busy)
+                profileTable
             }
-        }.padding(14)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+        }.alert("删除这个静态 IP？", isPresented: Binding(get: { profileToDelete != nil }, set: { if !$0 { profileToDelete = nil } }), presenting: profileToDelete) { profile in
+            Button("取消", role: .cancel) { profileToDelete = nil }
+            Button("删除", role: .destructive) {
+                model.call(["op": "delete", "id": profile.id])
+                profileToDelete = nil
+            }
+        } message: { profile in Text("删除「\(profile.name)」的本机记录和钥匙串密码。删除后，需重新添加才能再次选择这个出口。") }
+        .alert("清理已过期的静态 IP？", isPresented: $purging) {
+            Button("取消", role: .cancel) {}
+            Button("全部删除", role: .destructive) { purgeExpired(expiredIDs) }
+        } message: { Text("删除 \(expiredIDs.count) 个已过期静态 IP 的本机记录和钥匙串密码。正在使用的出口不会被删除。") }
     }
 
-    private var nodeSelector: some View {
-        ZStack {
-            HStack(spacing: 12) {
-                Image(systemName: "server.rack")
-                    .font(.system(size: 17)).foregroundStyle(.blue)
-                    .frame(width: 34, height: 34)
-                    .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("中转节点").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                    Text(model.relay.isEmpty ? "请选择订阅和节点" : model.relay)
-                        .font(.system(size: 13, weight: .medium)).foregroundStyle(.primary)
-                        .lineLimit(1).truncationMode(.tail)
-                }
-                Spacer(minLength: 12)
-                if !model.relay.isEmpty {
-                    Label(model.nodeDelayLabel(model.relay), systemImage: "waveform.path.ecg")
-                        .help(model.nodeDelayHelp(model.relay))
-                        .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .foregroundStyle(.secondary).padding(.horizontal, 9).padding(.vertical, 6)
-                        .background(Color.primary.opacity(0.045), in: Capsule()).fixedSize()
-                }
-                Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-            }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(nsColor: .windowBackgroundColor).opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(nodeSelectorHovered && !model.busy ? Color.blue.opacity(0.55) : Color.primary.opacity(0.10)))
-                .contentShape(RoundedRectangle(cornerRadius: 10))
-                .accessibilityHidden(true)
-            NodeSelectorControl(names: model.nodes,
-                                titles: model.nodes.map { "\($0)  ·  \(model.nodeDelayLabel($0))" },
-                                selection: $model.relay,
-                                enabled: !model.busy && !model.nodes.isEmpty,
-                                onChoose: { model.chooseRelay($0) })
-        }.frame(height: 58)
-            .onHover { nodeSelectorHovered = $0 }
-            .opacity(model.busy || model.nodes.isEmpty ? 0.5 : 1)
-    }
-
-    private var statusBar: some View {
-        VStack(spacing: 0) {
-            Divider()
-            HStack(spacing: 8) {
-                if model.busy { ProgressView().controlSize(.mini) }
-                else { Image(systemName: model.error ? "exclamationmark.circle" : "checkmark.circle").foregroundStyle(model.error ? Color.orange : .secondary) }
-                Text(model.busy ? model.activity : (model.message.isEmpty ? "就绪 · 订阅与静态 IP 保存在本机" : model.message))
-                    .font(.system(size: 12)).textSelection(.enabled).lineLimit(3)
-                Spacer(minLength: 8)
-                Text("独立版 v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
-            }.padding(.horizontal, 18).padding(.vertical, 10).frame(minHeight: 39).background(Color(nsColor: .controlBackgroundColor))
+    private func filterChip(_ item: Filter) -> some View {
+        let on = filter == item
+        let (label, dot): (String, Color?) = switch item {
+        case .all: ("全部", nil)
+        case .ok: ("可用", Palette.successDot)
+        case .soon: ("即将到期", Palette.dynamic(0xF79009, 0xFDB022))
+        case .expired: ("已过期", Palette.dynamic(0xF04438, 0xF97066))
         }
+        return Button { filter = item } label: {
+            HStack(spacing: 6) {
+                if let dot { Circle().fill(dot).frame(width: 7, height: 7) }
+                Text(label).font(.system(size: 12, weight: .medium))
+                Text("\(count(item))").font(.system(size: 11, design: .monospaced)).foregroundStyle(on ? Palette.accentText : Palette.text3)
+            }.padding(.horizontal, 12).frame(height: 32)
+                .foregroundStyle(on ? Palette.accentText : Palette.text)
+                .background(on ? Palette.accentSoft : Palette.surface, in: Capsule())
+                .overlay(Capsule().strokeBorder(on ? Palette.accentBorder : Palette.border))
+                .contentShape(Capsule())
+        }.buttonStyle(PressableStyle()).accessibilityAddTraits(on ? .isSelected : [])
+    }
+
+    private func sortButton(_ title: String, _ key: SortKey) -> some View {
+        Button {
+            if sortKey == key { sortAscending.toggle() } else { sortKey = key; sortAscending = true }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                Image(systemName: sortKey == key ? (sortAscending ? "arrow.up" : "arrow.down") : "arrow.up.arrow.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(sortKey == key ? Palette.accentText : Palette.idle)
+            }.contentShape(Rectangle())
+        }.buttonStyle(.plain)
+    }
+
+    private func columns<A: View, B: View, C: View, D: View, E: View>(_ a: A, _ b: B, _ c: C, _ d: D, _ e: E) -> some View {
+        HStack(spacing: 12) {
+            a.frame(width: 22)
+            b.frame(minWidth: 110, maxWidth: .infinity, alignment: .leading)
+            c.frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+            d.frame(width: 64, alignment: .leading)
+            e.frame(width: 170, alignment: .leading)
+        }
+    }
+
+    private var profileTable: some View {
+        let rows = filtered
+        return VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                columns(Color.clear, sortButton("名称", .name), Text("代理地址"), Text("协议"), sortButton("到期时间", .expiry))
+                Color.clear.frame(width: 30)
+            }.font(.system(size: 12, weight: .medium)).foregroundStyle(Palette.text3)
+                .padding(.horizontal, 20).frame(height: 38)
+                .background(Palette.subtle)
+                .overlay(alignment: .bottom) { Rectangle().fill(Palette.border).frame(height: 1) }
+            if rows.isEmpty {
+                VStack(spacing: 10) {
+                    Text("没有符合条件的静态 IP").font(.system(size: 13)).foregroundStyle(Palette.text3)
+                    Button("清除筛选") { search = ""; filter = .all }.buttonStyle(PanelButtonStyle(kind: .secondary, height: 32))
+                }.frame(maxWidth: .infinity).padding(.vertical, 36)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, profile in
+                            profileRow(profile, last: index == rows.count - 1)
+                        }
+                    }
+                }.frame(height: min(CGFloat(rows.count) * 53, 340))
+            }
+            HStack(spacing: 8) {
+                HStack(spacing: 0) {
+                    Text("显示 \(rows.count) / \(model.profiles.count) 个 · 当前选择 ")
+                    Text(model.selectedProfile?.server ?? "不使用静态 IP")
+                        .font(.system(size: 12, design: model.selectedProfile == nil ? .default : .monospaced)).foregroundStyle(Palette.text)
+                }.lineLimit(1)
+                Spacer()
+                if !expiredIDs.isEmpty {
+                    Button { purging = true } label: {
+                        Label("清理已过期（\(expiredIDs.count)）", systemImage: "trash")
+                    }.buttonStyle(.plain).foregroundStyle(Palette.danger).font(.system(size: 12, weight: .medium)).disabled(model.busy)
+                }
+            }.font(.system(size: 12)).foregroundStyle(Palette.text3)
+                .padding(.horizontal, 20).frame(minHeight: 42)
+                .overlay(alignment: .top) { Rectangle().fill(Palette.border).frame(height: 1) }
+        }.background(Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Palette.border))
+    }
+
+    private func profileRow(_ profile: ExitProfile, last: Bool) -> some View {
+        let on = model.selected == profile.id
+        let status = profile.expiryStatus
+        let expired = status == .expired
+        let days = profile.daysLeft ?? 0
+        let (pill, pillForeground, pillBackground): (String, Color, Color) = switch status {
+        case .expired: ("已过期 \(-days) 天", Palette.danger, Palette.dangerSoft)
+        case .soon: ("剩 \(days) 天", Palette.warning, Palette.warningSoft)
+        case .ok: ("剩 \(days) 天", Palette.text3, .clear)
+        case .unknown: ("", .clear, .clear)
+        }
+        return HStack(spacing: 8) {
+            Button {
+                guard !on else { return }
+                model.selected = profile.id
+                model.chooseProfile(profile.id)
+            } label: {
+                columns(
+                    Circle().strokeBorder(on ? Palette.accent : (expired ? Palette.idle : Palette.text3), style: StrokeStyle(lineWidth: on ? 5 : 1.5, dash: expired && !on ? [3, 2] : []))
+                        .frame(width: 18, height: 18),
+                    HStack(spacing: 8) {
+                        Text(profile.name).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                            .foregroundStyle(expired ? Palette.text3 : Palette.text)
+                        if isConfigured(profile) {
+                            Text(model.running ? "使用中" : "已保存").font(.system(size: 10, weight: .semibold)).foregroundStyle(Palette.accentText)
+                                .padding(.horizontal, 6).padding(.vertical, 1)
+                                .background(Palette.accentSoft, in: RoundedRectangle(cornerRadius: 6)).fixedSize()
+                        }
+                    },
+                    Text(profile.address).font(.system(size: 12, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                        .foregroundStyle(expired ? Palette.text3 : Palette.text2),
+                    Text(profile.protocol.uppercased()).font(.system(size: 10, weight: .semibold)).tracking(0.4)
+                        .foregroundStyle(Palette.text2).padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Palette.chip, in: RoundedRectangle(cornerRadius: 6)),
+                    HStack(spacing: 8) {
+                        Text(profile.expiryLabel).font(.system(size: 12, design: .monospaced)).foregroundStyle(expired ? Palette.text3 : Palette.text2)
+                        if !pill.isEmpty {
+                            Text(pill).font(.system(size: 11, weight: .medium)).foregroundStyle(pillForeground)
+                                .padding(.horizontal, 7).padding(.vertical, 1).background(pillBackground, in: Capsule()).fixedSize()
+                        }
+                    }
+                ).padding(.horizontal, 8).frame(minHeight: 46).contentShape(Rectangle())
+            }.buttonStyle(PressableStyle())
+                .disabled(model.busy || (expired && !on))
+                .help(expired ? "已过期，不能选择；如已续费请编辑到期时间。" : profile.name)
+                .accessibilityAddTraits(on ? .isSelected : [])
+            Menu {
+                Button("编辑") { editing = profile }
+                Button("删除", role: .destructive) { profileToDelete = profile }
+            } label: { Image(systemName: "ellipsis").font(.system(size: 13, weight: .semibold)) }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30, height: 30)
+                .disabled(model.busy).accessibilityLabel("更多操作：\(profile.name)")
+        }.padding(.horizontal, 12).padding(.vertical, 3)
+            .background(on ? Palette.selected : Palette.surface)
+            .overlay(alignment: .bottom) { if !last { Rectangle().fill(Palette.divider).frame(height: 1) } }
+            .contextMenu {
+                Button("编辑") { editing = profile }
+                Button("删除", role: .destructive) { profileToDelete = profile }
+            }
+    }
+
+    // MARK: - 出口设置
+
+    /// 「使用静态 IP」跟随列表选择，关闭即仅用中转节点出口；在列表中点选静态 IP 也会自动开启。
+    private var exitSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("出口设置").font(.system(size: 17, weight: .semibold))
+                Text("出口路由与环境一致性").font(.system(size: 13)).foregroundStyle(Palette.text3)
+            }
+            // 左列决定流量走哪个出口，右列让本机环境与出口所在地一致。
+            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow {
+                    settingRow("使用静态 IP",
+                               detail: usingStatic ? (model.globalStatic ? "全部公网流量经静态出口" : "国外 TCP 经静态出口，国内直连") : "已关闭，仅通过中转节点出口",
+                               isOn: usingStatic, enabled: !locked && !(model.profiles.isEmpty && !usingStatic)) { setUsingStatic(!usingStatic) }
+                        .help("关闭后仅通过中转节点连接；已连接时立即切换并验证，失败自动恢复。")
+                    settingRow("时区跟随出口",
+                               detail: model.appliedTimezone.isEmpty ? "系统时区与出口所在地保持一致" : "已设为 \(model.appliedTimezone)",
+                               isOn: model.syncTimezone, enabled: !locked) { model.setSyncTimezone(!model.syncTimezone) }
+                        .help("开启后连接期间把系统时区设为出口 IP 所在地时区（暂停“自动设置时区”），刷新网页即可生效（个别长时间未重启的 Chrome 需重启）；菜单栏时钟也会随之改变。关闭、停止连接或重启电脑后恢复原设置。")
+                }
+                Rectangle().fill(Palette.divider).frame(height: 1).gridCellColumns(2)
+                GridRow {
+                    settingRow("国内也走静态 IP",
+                               detail: usingStatic ? "国内网站也经静态出口，关闭则直连更快" : "需先开启「使用静态 IP」",
+                               isOn: model.globalStatic, enabled: !locked && (usingStatic || model.globalStatic)) { model.setGlobalStatic(!model.globalStatic) }
+                        .help("开启后除本机和局域网外全部经静态 IP 出口；静态 IP 不支持 UDP，公网 UDP（含微信通话、WebRTC）一律拦截。仅在使用静态 IP 时生效。")
+                    settingRow("Chrome 英文语言",
+                               detail: "浏览器界面与请求语言设为英文",
+                               isOn: model.browserLanguage, enabled: !model.busy) { languageTarget = !model.browserLanguage }
+                        .help("开启后 Chrome 网页语言（navigator.language、Accept-Language）与界面改为 en-US；关闭恢复原设置。切换时会退出并重开 Chrome，标签页自动恢复。")
+                }
+            }.background(Palette.surface, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Palette.border))
+        }.alert(languageTarget == true ? "把 Chrome 语言改为英文？" : "恢复 Chrome 原来的语言？", isPresented: Binding(get: { languageTarget != nil }, set: { if !$0 { languageTarget = nil } })) {
+            Button("取消", role: .cancel) { languageTarget = nil }
+            Button("退出并重开 Chrome") {
+                if let target = languageTarget { model.setBrowserLanguage(target) }
+                languageTarget = nil
+            }
+        } message: { Text("需要先退出 Chrome 才能修改语言，改完会重新打开并恢复标签页。未保存的网页表单内容可能丢失。") }
+    }
+
+    private func settingRow(_ title: String, detail: String, isOn: Bool, enabled: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail).font(.system(size: 11)).foregroundStyle(Palette.text2).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Toggle(title, isOn: Binding(get: { isOn }, set: { _ in action() }))
+                .labelsHidden().toggleStyle(.switch).controlSize(.small).tint(Palette.accent)
+        }.padding(.horizontal, 16).padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(!enabled).opacity(enabled ? 1 : 0.55)
+    }
+
+    private func setUsingStatic(_ on: Bool) {
+        if on {
+            guard model.selected == nil else { return }
+            let configured = model.profiles.first(where: isConfigured)
+            let usable = model.profiles.filter { $0.expiryStatus != .expired }
+            let target = model.profiles.first { $0.id == lastProfileID } ?? configured ?? filtered.first { $0.expiryStatus != .expired } ?? usable.first ?? model.profiles.first
+            guard let target else { return }
+            model.selected = target.id
+            model.chooseProfile(target.id)
+        } else {
+            guard let current = model.selected else { return }
+            lastProfileID = current
+            model.selected = nil
+            model.chooseProfile(nil)
+        }
+    }
+
+    /// 逐个删除（后端一次只处理一个操作），任一失败即停止并保留错误信息。
+    private func purgeExpired(_ ids: [String]) {
+        guard let id = ids.first else { return }
+        model.call(["op": "delete", "id": id]) { ok in if ok { purgeExpired(Array(ids.dropFirst())) } }
     }
 
     private func selectSubscription(_ item: Subscription) {
@@ -1326,6 +1766,15 @@ struct ContentView: View {
             model.call(["op": "import_subscription", "path": url.path, "name": url.deletingPathExtension().lastPathComponent]) { ok in
                 if ok { model.load(verify: false) }
             }
+        }
+    }
+}
+
+struct SavedLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.icon.foregroundStyle(Palette.success).font(.system(size: 12, weight: .semibold))
+            configuration.title
         }
     }
 }
@@ -1436,7 +1885,7 @@ struct ManagerApp: App {
     @StateObject private var model = Model()
     var body: some Scene {
         Window("静态出口管理器 · 独立版", id: "main") { ContentView(model: model) }
-            .defaultSize(width: 1100, height: 820)
+            .defaultSize(width: 1180, height: 880)
             .windowResizability(.contentMinSize)
             .commands {
                 CommandGroup(replacing: .appTermination) {

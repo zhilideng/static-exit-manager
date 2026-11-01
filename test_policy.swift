@@ -48,6 +48,20 @@ rejects("仅中转规则却带静态出口") { $0["rules"] = relayOnlyRules }
 rejects("静态出口规则却缺少静态出口") { $0["proxies"] = [($0["proxies"] as! [[String: Any]])[0]] }
 do { var input = relayOnlyFixture(); input["rules"] = staticExitRules.dropLast() + ["MATCH,DIRECT"]
      _ = try restrictedConfiguration(input); fatalError("没有拒绝：国外流量直连") } catch { passed += 1 }
+// 国内也走静态 IP：仅局域网直连、拒绝全部公网 UDP、国内域名不再走直连 DNS；必须带静态出口。
+do { var input = fixture(); input["rules"] = globalStaticRules
+     let global = try restrictedConfiguration(input)
+     check(global["rules"] as? [String] == globalStaticRules, "全局静态规则发生变化")
+     check(!globalStaticRules.contains { $0.hasPrefix("GEOSITE") || $0.hasPrefix("GEOIP") }, "全局静态仍有国内直连")
+     check(globalStaticRules.suffix(3) == ["IP-CIDR6,::/0,REJECT,no-resolve", "NETWORK,UDP,REJECT", "MATCH,静态IP出口"], "全局静态未拒绝 UDP 或出口不对")
+     check((global["dns"] as! [String: Any])["nameserver-policy"] == nil, "全局静态仍有国内直连 DNS"); passed += 4 }
+do { var input = relayOnlyFixture(); input["rules"] = globalStaticRules
+     _ = try restrictedConfiguration(input); fatalError("没有拒绝：全局静态缺少静态出口") } catch { passed += 1 }
+// 时区名称交给 root 的 systemsetup，必须是时区库里真实存在的 IANA 名称。
+check(validTimezoneName("America/Los_Angeles") && validTimezoneName("Asia/Shanghai"), "合法时区被拒绝")
+for bad in ["../../etc/passwd", "/etc/passwd", "America/../../etc/passwd", "America/Nowhere", "UTC -x", "", "America/Los_Angeles\n"] {
+    check(!validTimezoneName(bad), "接受了无效时区：" + bad)
+}
 let output = try restrictedConfiguration(fixture())
 check(output["mixed-port"] as? Int == 17896, "监听端口不固定")
 check(output["mode"] as? String == "rule", "规则模式不固定")

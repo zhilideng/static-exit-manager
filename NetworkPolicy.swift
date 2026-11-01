@@ -17,6 +17,15 @@ let staticExitRules = [
 ]
 // 未选择静态 IP：国外 TCP 以选定中转节点为出口，其余规则与静态出口模式一致。
 let relayOnlyRules = Array(staticExitRules.dropLast()) + ["MATCH,静态IP机场中转"]
+// 国内也走静态 IP：只保留本机与局域网直连；静态出口不支持 UDP，公网 UDP 一律拒绝。
+let globalStaticRules = Array(staticExitRules.prefix(11)) + Array(staticExitRules.suffix(3))
+
+/// 只接受系统时区库中真实存在的 IANA 名称；格式排除 “..” 与绝对路径，root 服务才会把它交给 systemsetup。
+func validTimezoneName(_ value: String) -> Bool {
+    guard value.utf8.count <= 64, value.range(of: "^[A-Za-z_]+(/[A-Za-z0-9_+\\-]+){1,2}$", options: .regularExpression) != nil else { return false }
+    var info = stat()
+    return stat("/usr/share/zoneinfo/" + value, &info) == 0 && info.st_mode & S_IFMT == S_IFREG
+}
 
 private func policyFailure(_ message: String = "配置包含不支持的字段或无效值。") -> NetworkFailure { .message(message) }
 private func cleanString(_ value: Any?, max: Int = 8192, empty: Bool = true) -> Bool {
@@ -120,7 +129,7 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
     guard Set(input.keys).isSubset(of: allowed), let token = input["secret"] as? String,
           (32...128).contains(token.utf8.count), token.unicodeScalars.allSatisfy(safeToken.contains),
           let proxies = input["proxies"] as? [[String: Any]], (1...3000).contains(proxies.count),
-          let rules = input["rules"] as? [String], rules == staticExitRules || rules == relayOnlyRules,
+          let rules = input["rules"] as? [String], [staticExitRules, relayOnlyRules, globalStaticRules].contains(rules),
           let groups = input["proxy-groups"] as? [[String: Any]], groups.count == 1,
           Set(groups[0].keys) == Set(["name", "type", "proxies"]),
           groups[0]["name"] as? String == "静态IP机场中转", groups[0]["type"] as? String == "select",
@@ -163,7 +172,8 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
     let relayOnly = rules == relayOnlyRules
     guard names.contains("静态IP出口") != relayOnly else { throw policyFailure("配置不符合静态出口服务的范围。") }
     guard choices[0] != "静态IP出口", names.contains(choices[0]) else { throw policyFailure("中转节点不存在。") }
-    let dns: [String: Any] = [
+    let globalStatic = rules == globalStaticRules
+    var dns: [String: Any] = [
         "enable": true, "listen": "127.0.0.1:17895", "ipv6": false,
         "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
         "fake-ip-filter": ["*.lan", "*.local", "localhost"], "respect-rules": true,
@@ -171,6 +181,8 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         "proxy-server-nameserver": ["https://223.5.5.5/dns-query#DIRECT"],
         "nameserver-policy": ["geosite:cn": ["https://223.5.5.5/dns-query#DIRECT"]]
     ]
+    // 全局静态模式下国内域名也经静态出口解析，与出口地区保持一致。
+    if globalStatic { dns["nameserver-policy"] = nil }
     return [
         "external-controller-unix": networkServiceRoot + "/runtime/controller.sock", "secret": token,
         "mixed-port": 17896, "allow-lan": false, "bind-address": "127.0.0.1", "mode": "rule",
@@ -179,6 +191,6 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         "tun": ["enable": true, "device": "utun78", "stack": "mixed", "auto-route": true,
                 // macOS 默认不注册系统 DNS；显式使用临时 resolver，避免浏览器继续查询局域网 DNS。
                 "auto-detect-interface": true, "strict-route": true, "dns-hijack": ["any:53", "tcp://any:53"], "dns-mode": "native"] as [String: Any],
-        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": relayOnly ? relayOnlyRules : staticExitRules
+        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": relayOnly ? relayOnlyRules : (globalStatic ? globalStaticRules : staticExitRules)
     ]
 }

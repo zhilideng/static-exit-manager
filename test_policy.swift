@@ -77,6 +77,29 @@ let outputDNS = output["dns"] as! [String: Any]
 check(outputDNS["default-nameserver"] as? [String] == ["223.5.5.5"], "基础 DNS 被更改")
 check(outputDNS["proxy-server-nameserver"] as? [String] == ["https://223.5.5.5/dns-query#DIRECT"], "中转域名解析没有显式直连")
 check((outputDNS["nameserver-policy"] as? [String: [String]])?["geosite:cn"] == ["https://223.5.5.5/dns-query#DIRECT"], "国内 DNS 没有显式直连")
+// 直连白名单：三种模式都可插入，域名同时走国内直连 DNS；格式外的规则、出口或数量一律拒绝。
+let whitelist = ["DOMAIN-SUFFIX,example.com,DIRECT", "IP-CIDR,203.0.113.0/24,DIRECT,no-resolve", "IP-CIDR6,2001:db8::/32,DIRECT,no-resolve"]
+func withWhitelist(_ base: [String], _ entries: [String] = whitelist) -> [String] { var rules = base; rules.insert(contentsOf: entries, at: 11); return rules }
+for (title, base, input) in [("静态出口", staticExitRules, fixture()), ("仅中转", relayOnlyRules, relayOnlyFixture()), ("全局静态", globalStaticRules, fixture())] {
+    var value = input; value["rules"] = withWhitelist(base)
+    let result = try restrictedConfiguration(value)
+    check(result["rules"] as? [String] == withWhitelist(base), title + "白名单规则未保留")
+    let policy = (result["dns"] as! [String: Any])["nameserver-policy"] as? [String: [String]]
+    check(policy?["+.example.com"] == ["https://223.5.5.5/dns-query#DIRECT"], title + "白名单域名未走国内 DNS")
+    check((policy?["geosite:cn"] != nil) == (base != globalStaticRules), title + "国内 DNS 策略被白名单改变")
+}
+for bad in ["DOMAIN-SUFFIX,example.com,静态IP出口", "DOMAIN-SUFFIX,a.com,DIRECT,no-resolve", "DOMAIN-KEYWORD,google,DIRECT", "DOMAIN-SUFFIX,Example.com,DIRECT",
+            "IP-CIDR,0.0.0.0/0,DIRECT,no-resolve", "IP-CIDR,1.2.3.4/33,DIRECT,no-resolve", "IP-CIDR,1.2.3/24,DIRECT,no-resolve", "IP-CIDR6,::/0,DIRECT,no-resolve",
+            "IP-CIDR,1.2.3.4/32,DIRECT", "MATCH,DIRECT", "DOMAIN-SUFFIX,com,DIRECT"] {
+    rejects("白名单格式外规则：" + bad) { $0["rules"] = withWhitelist(staticExitRules, [bad]) }
+}
+rejects("白名单插在固定规则之后") { var rules = staticExitRules; rules.insert("DOMAIN-SUFFIX,example.com,DIRECT", at: 13); $0["rules"] = rules }
+rejects("白名单重复") { $0["rules"] = withWhitelist(staticExitRules, [whitelist[0], whitelist[0]]) }
+rejects("白名单超过上限") { $0["rules"] = withWhitelist(staticExitRules, (0...whitelistLimit).map { "DOMAIN-SUFFIX,h\($0).example.com,DIRECT" }) }
+check(shouldCloseConnections(previous: ["rules": withWhitelist(staticExitRules)], next: ["rules": staticExitRules]), "删除白名单后未断开旧连接")
+check(shouldCloseConnections(previous: ["rules": staticExitRules], next: ["rules": globalStaticRules]), "切换国内出口后未断开旧连接")
+check(!shouldCloseConnections(previous: ["rules": staticExitRules], next: ["rules": staticExitRules]), "规则未变也断开了连接")
+check(!shouldCloseConnections(previous: nil, next: ["rules": staticExitRules]), "首次启动不需要断开连接")
 rejects("curl 配置注入") { $0["secret"] = String(repeating: "A", count: 32) + "\"\noutput=/tmp/injected" }
 rejects("过短控制 token") { $0["secret"] = "abc" }
 rejects("额外任意配置路径") { $0["external-ui"] = "/etc" }

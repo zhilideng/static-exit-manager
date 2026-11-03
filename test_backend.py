@@ -95,6 +95,29 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(relay_only['rules'], b.RELAY_ONLY_RULES)
         self.assertIn('nameserver-policy', relay_only['dns'])
 
+    def test_whitelist_entries_normalize_from_one_text_box(self):
+        cases = {'https://A.Example.com/path?q=1': 'a.example.com', '*.foo.cn': 'foo.cn', '1.2.3.4:443': '1.2.3.4',
+                 '1.2.3.9/24': '1.2.3.0/24', 'http://[2001:db8::1]:8080/': '2001:db8::1', '例子.中国': 'xn--fsqu00a.xn--fiqs8s'}
+        for raw, expected in cases.items():
+            self.assertEqual(b.whitelist_entry(raw), expected, raw)
+        for raw in ('localhost', '0.0.0.0/0', 'a b.com', 'foo,DIRECT', 'x' * 300):
+            self.assertIsNone(b.whitelist_entry(raw), raw)
+        self.assertEqual(b.normalize_whitelist(['example.com', '', 'EXAMPLE.com', ' 1.2.3.4 ']), ['example.com', '1.2.3.4'])
+        with self.assertRaises(ValueError):
+            b.normalize_whitelist(['example.com', 'not a host'])
+
+    def test_whitelist_goes_direct_before_static_and_relay_rules_in_every_mode(self):
+        entries = ['example.com', '203.0.113.0/24', '198.51.100.7']
+        expected = ['DOMAIN-SUFFIX,example.com,DIRECT', 'IP-CIDR,203.0.113.0/24,DIRECT,no-resolve', 'IP-CIDR,198.51.100.7/32,DIRECT,no-resolve']
+        for profile, extra, base in ((self.profile, {}, b.RULES), (self.profile, {'global_static': True}, b.GLOBAL_STATIC_RULES), (None, {}, b.RELAY_ONLY_RULES)):
+            result = b.generate_config(self.source, profile, '日本一', {**self.preferences, **extra, 'direct_whitelist': entries})
+            self.assertEqual(result['rules'][11:14], expected)
+            # 白名单在拒绝 UDP 之前，命中的 UDP 也直连。
+            self.assertLess(result['rules'].index(expected[0]), result['rules'].index('NETWORK,UDP,REJECT'))
+            self.assertEqual(b.base_rules(result['rules']), base)
+            self.assertEqual(result['dns']['nameserver-policy']['+.example.com'], ['https://223.5.5.5/dns-query#DIRECT'])
+            self.assertEqual('geosite:cn' in result['dns']['nameserver-policy'], not extra)
+
     def test_timezone_follows_exit_and_restores_when_disabled(self):
         b.put_json(self.data / 'settings.json', {**self.preferences, 'last_verified_ip': '8.8.4.4'})
         reply = subprocess.CompletedProcess([], 0, json.dumps({'success': True, 'ip': '8.8.4.4', 'timezone': {'id': 'America/Los_Angeles'}}).encode(), b'')

@@ -272,6 +272,8 @@ struct ExitLocation: Decodable {
     /// 国内也走静态 IP：仅在使用静态 IP 时生效，公网 UDP 全部拒绝。
     @Published var globalStatic = false
     @Published var syncTimezone = false
+    /// 直连白名单：命中的域名与 IP 不经静态 IP 和中转节点，三种模式下都生效。
+    @Published var directWhitelist: [String] = []
     @Published var browserLanguage = false
     /// 网络服务当前套用的出口时区；空表示系统时区未被修改。
     @Published var appliedTimezone = ""
@@ -351,6 +353,14 @@ struct ExitLocation: Decodable {
         let profileID = running ? activeProfileID : (selected ?? "")
         let currentRelay = running && !activeRelay.isEmpty ? activeRelay : relay
         call(["op": "set_global_static", "enabled": enabled, "id": profileID, "relay": currentRelay])
+    }
+
+    /// 已连接时立即按当前出口重新应用并验证，失败自动恢复原白名单；未连接时只保存。
+    func setWhitelist(_ entries: [String], completion: @escaping (Bool) -> Void) {
+        guard stateKnown, !recoveryNeeded, !busy else { completion(false); return }
+        let profileID = running ? activeProfileID : (selected ?? "")
+        let currentRelay = running && !activeRelay.isEmpty ? activeRelay : relay
+        call(["op": "set_whitelist", "entries": entries, "id": profileID, "relay": currentRelay], completion: completion)
     }
 
     /// 系统时区跟随出口：已连接时立即设置或恢复，刷新网页即可生效；未连接时只记住设置。
@@ -517,6 +527,7 @@ struct ExitLocation: Decodable {
             "switch": running ? "正在验证并切换出口…" : "正在保存出口选择…",
             "set_global_static": running ? "正在切换国内流量出口并验证…" : "正在保存设置…",
             "set_sync_timezone": running ? "正在设置系统时区…" : "正在保存设置…",
+            "set_whitelist": running ? "正在更新直连白名单并验证…" : "正在保存直连白名单…",
             "set_browser_language": "正在退出 Chrome 并修改语言…",
             "verify": "正在验证静态出口、系统 DNS 与网页连接…", "import_current": "正在载入当前静态 IP…",
             "import": "正在导入静态 IP…", "save": "正在保存…", "restore": "正在恢复配置…",
@@ -526,9 +537,8 @@ struct ExitLocation: Decodable {
             "update_subscription": "正在更新订阅…", "delete_subscription": "正在删除订阅…"
         ]
         activity = labels[op] ?? "正在处理…"
-        if ["verify", "start", "stop", "switch", "select_subscription", "restore"].contains(op) || (op == "set_global_static" && running) {
-            clearExitVerification()
-        }
+        let clearsExit = ["verify", "start", "stop", "switch", "select_subscription", "restore"].contains(op) || (["set_global_static", "set_whitelist"].contains(op) && running)
+        if clearsExit { clearExitVerification() }
         Task {
             let beganAt = ProcessInfo.processInfo.systemUptime
             let result = await backendReply(request)
@@ -549,6 +559,7 @@ struct ExitLocation: Decodable {
                 error = true
                 busy = false
                 completion?(false)
+                reverifyIfCleared(clearsExit && op != "verify")
                 return
             }
             apply(result)
@@ -562,7 +573,14 @@ struct ExitLocation: Decodable {
             if recoveryNeeded { error = true; if message.isEmpty { message = "上次配置操作未完成，请停止连接后恢复管理。" } }
             busy = false
             completion?(true)
+            reverifyIfCleared(clearsExit && op != "verify")
         }
+    }
+
+    /// 操作前清空了出口检测，但结果没有带回新出口（未改动、失败后恢复等）且仍在连接时，重新实测一次，避免停在「等待检测」。
+    private func reverifyIfCleared(_ cleared: Bool) {
+        guard cleared, running, stateKnown, !recoveryNeeded, exitIP.isEmpty else { return }
+        call(["op": "verify"])
     }
 
     private func markStateUnknown(_ reason: String?) {
@@ -669,6 +687,7 @@ struct ExitLocation: Decodable {
         if let value = result["migrated"] as? Bool { migrated = value }
         if let value = result["global_static"] as? Bool { globalStatic = value }
         if let value = result["sync_timezone"] as? Bool { syncTimezone = value }
+        if let value = result["direct_whitelist"] as? [String] { directWhitelist = value }
         if let value = result["browser_language"] as? Bool { browserLanguage = value }
         if let value = result["timezone"] as? String { appliedTimezone = value }
         if let value = result["service_status"] as? String, ["enabled", "notRegistered"].contains(value) { serviceStatus = value }
@@ -987,6 +1006,7 @@ struct ContentView: View {
     @State private var targetSubscription: Subscription?
     @State private var nodeSelectorHovered = false
     @State private var languageTarget: Bool?
+    @State private var editingWhitelist = false
     /// 关闭「使用静态 IP」前的选择，重新开启时优先恢复。
     @State private var lastProfileID: String?
 
@@ -1060,6 +1080,7 @@ struct ContentView: View {
         .sheet(isPresented: $adding) { AddView(model: model) }
         .sheet(item: $editing) { profile in AddView(model: model, existing: profile) }
         .sheet(isPresented: $addingSubscription) { AddSubscriptionView(model: model) }
+        .sheet(isPresented: $editingWhitelist) { WhitelistView(model: model) }
         .alert(model.running ? "应用这个静态出口？" : "保存这个出口选择？", isPresented: $confirming) {
             Button("取消", role: .cancel) {}
             Button(model.running ? "验证并切换" : "保存选择") {
@@ -1685,6 +1706,20 @@ struct ContentView: View {
                                isOn: model.browserLanguage, enabled: !model.busy) { languageTarget = !model.browserLanguage }
                         .help("开启后 Chrome 网页语言（navigator.language、Accept-Language）与界面改为 en-US；关闭恢复原设置。切换时会退出并重开 Chrome，标签页自动恢复。")
                 }
+                Rectangle().fill(Palette.divider).frame(height: 1).gridCellColumns(2)
+                GridRow {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("直连白名单").font(.system(size: 13, weight: .semibold))
+                            Text(model.directWhitelist.isEmpty ? "命中的网站与 IP 用本机网络直连，不经静态 IP 和中转节点" : "\(model.directWhitelist.count) 条 · " + model.directWhitelist.prefix(3).joined(separator: "、") + (model.directWhitelist.count > 3 ? "…" : ""))
+                                .font(.system(size: 11)).foregroundStyle(Palette.text2).lineLimit(1).truncationMode(.tail)
+                        }
+                        Spacer(minLength: 8)
+                        Button("编辑") { editingWhitelist = true }.controlSize(.small).disabled(locked)
+                    }.padding(.horizontal, 16).padding(.vertical, 11)
+                        .frame(maxWidth: .infinity, alignment: .leading).gridCellColumns(2)
+                        .help("填入的域名（含子域名）与 IP/网段在所有模式下都直接使用本机网络，TCP 与 UDP 均放行，域名用国内 DNS 解析。")
+                }
             }.background(Palette.surface, in: RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Palette.border))
         }.alert(languageTarget == true ? "把 Chrome 语言改为英文？" : "恢复 Chrome 原来的语言？", isPresented: Binding(get: { languageTarget != nil }, set: { if !$0 { languageTarget = nil } })) {
@@ -1776,6 +1811,39 @@ struct SavedLabelStyle: LabelStyle {
             configuration.icon.foregroundStyle(Palette.success).font(.system(size: 12, weight: .semibold))
             configuration.title
         }
+    }
+}
+
+struct WhitelistView: View {
+    @ObservedObject var model: Model
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    private var entries: [String] {
+        text.split(whereSeparator: { $0.isNewline || $0 == "," || $0 == "，" || $0 == " " })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("直连白名单").font(.title2.bold())
+            Text("每行一个域名、网址或 IP/网段。命中的流量用本机网络直连，不经静态 IP 和中转节点。")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: $text)
+                .font(.system(size: 13, design: .monospaced)).frame(height: 220)
+                .scrollContentBackground(.hidden).padding(6)
+                .background(Palette.surface, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Palette.border))
+            Text("例：example.com（含所有子域名）、https://a.example.com/path、203.0.113.5、203.0.113.0/24。已连接时保存会立即重新应用并验证。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if model.error { Text(model.message).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+            HStack {
+                Text("\(entries.count) 条").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("保存") { model.setWhitelist(entries) { ok in if ok { dismiss() } } }
+                    .buttonStyle(.borderedProminent)
+            }.disabled(model.busy)
+        }.padding(24).frame(width: 480)
+            .onAppear { text = model.directWhitelist.joined(separator: "\n") }
     }
 }
 

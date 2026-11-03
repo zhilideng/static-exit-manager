@@ -68,6 +68,11 @@ RULES = [
 RELAY_ONLY_RULES = RULES[:-1] + ['MATCH,' + RELAY_NAME]
 # 国内也走静态 IP：只保留本机与局域网直连；静态出口不支持 UDP，公网 UDP（含国内与 WebRTC STUN）一律拒绝。
 GLOBAL_STATIC_RULES = RULES[:11] + RULES[-3:]
+# 直连白名单插在局域网规则之后、其余规则之前：三种模式下都优先直连，TCP 与 UDP 均放行。
+WHITELIST_INDEX = 11
+WHITELIST_LIMIT = 500
+DOMESTIC_DOH = 'https://223.5.5.5/dns-query#DIRECT'
+DOMAIN_PATTERN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
 
 
 def now():
@@ -1042,6 +1047,77 @@ def static_proxy(profile):
     return proxy
 
 
+def whitelist_entry(text):
+    """把一行输入规范化为域名或 IP/网段；网址取主机名，*.、前导点与端口忽略。无法识别返回 None。"""
+    value = str(text).strip().lower()
+    if not value or len(value) > 2048:
+        return None
+    candidates = [value]
+    try:
+        host = urllib.parse.urlsplit(value if '://' in value else '//' + value).hostname
+    except ValueError:
+        host = None
+    if host:
+        candidates.append(host)
+    for candidate in candidates:
+        try:
+            network = ipaddress.ip_network(candidate, strict=False)
+        except ValueError:
+            continue
+        # /0 等于全部直连，不是白名单。
+        if network.prefixlen == 0:
+            return None
+        return str(network.network_address) if network.prefixlen == network.max_prefixlen else str(network)
+    domain = (host or '').lstrip('*+.').rstrip('.')
+    try:
+        domain = domain.encode('idna').decode('ascii')
+    except UnicodeError:
+        return None
+    return domain if '.' in domain and DOMAIN_PATTERN.match(domain) else None
+
+
+def normalize_whitelist(entries):
+    if not isinstance(entries, list):
+        raise ValueError('白名单格式无效。')
+    result, invalid = [], []
+    for line in entries:
+        if not str(line).strip():
+            continue
+        entry = whitelist_entry(line)
+        if entry is None:
+            invalid.append(str(line).strip()[:80])
+        elif entry not in result:
+            result.append(entry)
+    if invalid:
+        raise ValueError('无法识别为域名或 IP：' + '、'.join(invalid[:5]) + ('等' if len(invalid) > 5 else '') + '。')
+    if len(result) > WHITELIST_LIMIT:
+        raise ValueError('白名单最多 %d 条。' % WHITELIST_LIMIT)
+    return result
+
+
+def whitelist_rules(entries):
+    rules, domains = [], []
+    for entry in entries:
+        try:
+            network = ipaddress.ip_network(entry, strict=False)
+        except ValueError:
+            # 保存时已规范化；这里再过一遍，手改的设置文件也不会产生无效规则。
+            entry = whitelist_entry(entry)
+            if entry is None or '/' in entry or ':' in entry:
+                continue
+            rules.append('DOMAIN-SUFFIX,' + entry + ',DIRECT')
+            domains.append(entry)
+            continue
+        rules.append(('IP-CIDR,' if network.version == 4 else 'IP-CIDR6,') + str(network) + ',DIRECT,no-resolve')
+    return list(dict.fromkeys(rules))[:WHITELIST_LIMIT], list(dict.fromkeys(domains))
+
+
+def base_rules(rules):
+    """去掉白名单规则，得到三种固定模式之一，用于判断当前模式。"""
+    return rules[:WHITELIST_INDEX] + [rule for rule in rules[WHITELIST_INDEX:]
+                                      if not rule.startswith(('DOMAIN-SUFFIX,', 'IP-CIDR,', 'IP-CIDR6,')) or rule == 'IP-CIDR6,::/0,REJECT,no-resolve']
+
+
 def generate_config(config, profile, relay, preferences):
     nodes = available_nodes(config)
     if relay not in nodes:
@@ -1051,6 +1127,12 @@ def generate_config(config, profile, relay, preferences):
         raise RuntimeError('控制接口尚未初始化。')
     # 只在使用静态 IP 时生效；仅中转模式不受此开关影响。
     global_static = bool(profile) and bool(preferences.get('global_static'))
+    rules = (GLOBAL_STATIC_RULES[:] if global_static else RULES[:]) if profile else RELAY_ONLY_RULES[:]
+    direct, domains = whitelist_rules(preferences.get('direct_whitelist') or [])
+    rules[WHITELIST_INDEX:WHITELIST_INDEX] = direct
+    # 白名单域名用国内 DNS 直连解析，解析结果与本机网络匹配。
+    policy = {} if global_static else {'geosite:cn': [DOMESTIC_DOH]}
+    policy.update({'+.' + domain: [DOMESTIC_DOH] for domain in domains})
     return {'mixed-port': MIXED_PORT, 'allow-lan': False, 'bind-address': '127.0.0.1',
             'secret': token,
             'mode': 'rule', 'ipv6': False, 'log-level': 'warning', 'find-process-mode': 'off',
@@ -1065,11 +1147,11 @@ def generate_config(config, profile, relay, preferences):
                     'fake-ip-filter': ['*.lan', '*.local', 'localhost'], 'respect-rules': True,
                     'default-nameserver': ['223.5.5.5'],
                     'nameserver': ['https://1.1.1.1/dns-query'],
-                    'proxy-server-nameserver': ['https://223.5.5.5/dns-query#DIRECT'],
-                    **({} if global_static else {'nameserver-policy': {'geosite:cn': ['https://223.5.5.5/dns-query#DIRECT']}})},
+                    'proxy-server-nameserver': [DOMESTIC_DOH],
+                    **({'nameserver-policy': policy} if policy else {})},
             'proxies': copy.deepcopy(config['proxies']) + ([static_proxy(profile)] if profile else []),
             'proxy-groups': [{'name': RELAY_NAME, 'type': 'select', 'proxies': [relay]}],
-            'rules': (GLOBAL_STATIC_RULES[:] if global_static else RULES[:]) if profile else RELAY_ONLY_RULES[:]}
+            'rules': rules}
 
 
 def chosen_profile(profile_id):
@@ -1572,7 +1654,7 @@ def transaction(config, next_settings, expected='', commit=None, rollback_commit
         (DATA / 'pending.json').unlink(missing_ok=True)
         return {'ip': actual, 'verified_at': next_settings['verified_at'],
                 'deferred_checks_pending': True,
-                'message': '配置已应用，' + ('静态出口' if config['rules'][-1] == 'MATCH,' + EXIT_NAME else '中转出口') + ('（国内也走静态 IP）' if config['rules'] == GLOBAL_STATIC_RULES else '') + '、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
+                'message': '配置已应用，' + ('静态出口' if config['rules'][-1] == 'MATCH,' + EXIT_NAME else '中转出口') + ('（国内也走静态 IP）' if base_rules(config['rules']) == GLOBAL_STATIC_RULES else '') + '、系统 TUN 与 DNS 接管已验证。' + system_check.get('warning', '')}
     except Exception as error:
         try:
             if rollback_commit is not None:
@@ -1595,11 +1677,13 @@ def transaction(config, next_settings, expected='', commit=None, rollback_commit
         raise RuntimeError('应用失败，已恢复原配置或停止新启动的服务。' + message) from None
 
 
-def select_and_apply(uid=None, profile_id=None, relay=None, start=False, global_static=None):
+def select_and_apply(uid=None, profile_id=None, relay=None, start=False, global_static=None, whitelist=None):
     require_settled()
     preferences = settings(create=True)
     if global_static is not None:
         preferences['global_static'] = bool(global_static)
+    if whitelist is not None:
+        preferences['direct_whitelist'] = whitelist
     uid = uid or preferences.get('current_subscription_uid')
     item = subscription(uid)
     source = cached(item)
@@ -1629,6 +1713,21 @@ def select_and_apply(uid=None, profile_id=None, relay=None, start=False, global_
         timezone, warning = follow_exit_timezone(result['ip'])
         result['message'] += warning or ' 系统时区已跟随出口设为 ' + timezone + '。'
     return {**status(), **result}
+
+
+def set_whitelist(entries, profile_id=None, relay=None):
+    """已连接时立即按当前出口重新应用并验证，失败自动恢复原配置与原白名单；未连接时只保存。"""
+    whitelist = normalize_whitelist(entries)
+    require_settled()
+    preferences = settings(create=True)
+    unchanged = whitelist == (preferences.get('direct_whitelist') or [])
+    if unchanged or not known_service_status().get('running'):
+        preferences['direct_whitelist'] = whitelist
+        put_json(DATA / 'settings.json', preferences)
+        return {**status(), 'message': '已保存直连白名单（%d 条）' % len(whitelist) + ('。' if unchanged else '；连接后生效。')}
+    result = select_and_apply(profile_id=profile_id, relay=relay, whitelist=whitelist)
+    result['message'] = '直连白名单已更新（%d 条）。' % len(whitelist) + result.get('message', '')
+    return result
 
 
 SERVICE_ROOT = Path('/Library/Application Support/StaticExitManagerService')
@@ -2141,7 +2240,7 @@ def status():
             'nodes': available_nodes(config), 'node_delays': cached_node_delays(selected['uid'], config) if selected else {},
             'relay': preferences['relays'].get(selected['uid'], '') if selected else '',
             'profiles': profiles(), 'selected_profile_id': preferences['selected_profile_id'], 'selected_id': preferences['selected_profile_id'],
-            'migrated': bool(preferences.get('migrated_at')), 'global_static': bool(preferences.get('global_static')),
+            'migrated': bool(preferences.get('migrated_at')), 'global_static': bool(preferences.get('global_static')), 'direct_whitelist': preferences.get('direct_whitelist') or [],
             'sync_timezone': bool(preferences.get('sync_timezone')), 'browser_language': bool(preferences.get('browser_language')), 'timezone': state.get('timezone', '') if state.get('running') else '', 'service_status': state.get('service_status', 'unavailable'),
             'running': bool(state.get('running')), 'tun': bool(state.get('tun')),
             'mode': 'rule' if state.get('running') else 'stopped', 'mixed_port': state.get('mixed_port', MIXED_PORT),
@@ -2402,6 +2501,7 @@ def dispatch(request):
         return select_and_apply(request.get('uid'), request.get('id'), request.get('relay'), start=op == 'start')
     if op == 'set_global_static':
         return select_and_apply(profile_id=request.get('id'), relay=request.get('relay'), global_static=bool(request.get('enabled')))
+    if op == 'set_whitelist': return set_whitelist(request.get('entries'), request.get('id'), request.get('relay'))
     if op == 'select_subscription': return choose_subscription(request['uid'])
     if op == 'stop':
         service('stop')

@@ -20,6 +20,51 @@ let relayOnlyRules = Array(staticExitRules.dropLast()) + ["MATCH,静态IP机场�
 // 国内也走静态 IP：只保留本机与局域网直连；静态出口不支持 UDP，公网 UDP 一律拒绝。
 let globalStaticRules = Array(staticExitRules.prefix(11)) + Array(staticExitRules.suffix(3))
 
+// 直连白名单：插在局域网规则之后，三种模式下都优先直连。逐条按固定格式校验，不能借此注入其他规则或出口。
+let whitelistIndex = 11
+let whitelistLimit = 500
+private let whitelistDomainPattern = try! NSRegularExpression(pattern: "^DOMAIN-SUFFIX,((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?),DIRECT$")
+private let whitelistNetwork = try! NSRegularExpression(pattern: "^(IP-CIDR|IP-CIDR6),([0-9a-f.:]+)/([0-9]{1,3}),DIRECT,no-resolve$")
+
+/// 合法白名单规则返回其域名（IP 规则返回空字符串），否则返回 nil。
+func whitelistDomain(_ rule: String) -> String? {
+    let range = NSRange(rule.startIndex..., in: rule)
+    if let match = whitelistDomainPattern.firstMatch(in: rule, range: range), let domain = Range(match.range(at: 1), in: rule) {
+        return rule[domain].utf8.count <= 253 ? String(rule[domain]) : nil
+    }
+    guard let match = whitelistNetwork.firstMatch(in: rule, range: range),
+          let kind = Range(match.range(at: 1), in: rule), let address = Range(match.range(at: 2), in: rule),
+          let prefix = Range(match.range(at: 3), in: rule), let length = Int(rule[prefix]) else { return nil }
+    let v4 = rule[kind] == "IP-CIDR"
+    var buffer = [UInt8](repeating: 0, count: 16)
+    guard inet_pton(v4 ? AF_INET : AF_INET6, String(rule[address]), &buffer) == 1,
+          (1...(v4 ? 32 : 128)).contains(length) else { return nil }
+    return ""
+}
+
+/// 热重载不会断开已建立的连接：分流规则变化时需要断开旧连接，浏览器复用的直连或代理通道才会按新规则重建。
+func shouldCloseConnections(previous: [String: Any]?, next: [String: Any]) -> Bool {
+    guard let before = previous?["rules"] as? [String], let after = next["rules"] as? [String] else { return false }
+    return before != after
+}
+
+/// 拆出白名单规则与其余规则；其余部分必须正好是三种固定模式之一。
+func splitWhitelist(_ rules: [String]) throws -> (base: [String], whitelist: [String], domains: [String]) {
+    guard rules.count >= whitelistIndex else { throw policyFailure("配置不符合静态出口服务的范围。") }
+    var whitelist: [String] = [], domains: [String] = []
+    var index = whitelistIndex
+    while index < rules.count, let domain = whitelistDomain(rules[index]) {
+        whitelist.append(rules[index]); if !domain.isEmpty { domains.append(domain) }
+        index += 1
+    }
+    let base = Array(rules.prefix(whitelistIndex)) + Array(rules.dropFirst(index))
+    guard whitelist.count <= whitelistLimit, Set(whitelist).count == whitelist.count,
+          [staticExitRules, relayOnlyRules, globalStaticRules].contains(base) else {
+        throw policyFailure("配置不符合静态出口服务的范围。")
+    }
+    return (base, whitelist, domains)
+}
+
 /// 只接受系统时区库中真实存在的 IANA 名称；格式排除 “..” 与绝对路径，root 服务才会把它交给 systemsetup。
 func validTimezoneName(_ value: String) -> Bool {
     guard value.utf8.count <= 64, value.range(of: "^[A-Za-z_]+(/[A-Za-z0-9_+\\-]+){1,2}$", options: .regularExpression) != nil else { return false }
@@ -129,13 +174,14 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
     guard Set(input.keys).isSubset(of: allowed), let token = input["secret"] as? String,
           (32...128).contains(token.utf8.count), token.unicodeScalars.allSatisfy(safeToken.contains),
           let proxies = input["proxies"] as? [[String: Any]], (1...3000).contains(proxies.count),
-          let rules = input["rules"] as? [String], [staticExitRules, relayOnlyRules, globalStaticRules].contains(rules),
+          let rules = input["rules"] as? [String], rules.count <= staticExitRules.count + whitelistLimit,
           let groups = input["proxy-groups"] as? [[String: Any]], groups.count == 1,
           Set(groups[0].keys) == Set(["name", "type", "proxies"]),
           groups[0]["name"] as? String == "静态IP机场中转", groups[0]["type"] as? String == "select",
           let choices = groups[0]["proxies"] as? [String], choices.count == 1 else {
         throw policyFailure("配置不符合静态出口服务的范围。")
     }
+    let (baseRules, whitelist, whitelistDomains) = try splitWhitelist(rules)
     let types: Set<String> = ["ss", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "anytls", "socks5", "http"]
     let strings: Set<String> = ["name", "type", "server", "password", "username", "uuid", "cipher", "sni", "servername", "client-fingerprint", "fingerprint", "network", "flow", "encryption", "packet-encoding", "dialer-proxy", "obfs", "obfs-password", "auth", "auth-str", "ports", "mport", "congestion-controller", "udp-relay-mode"]
     let bools: Set<String> = ["udp", "tls", "skip-cert-verify", "disable-sni", "reduce-rtt"]
@@ -169,10 +215,10 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         } else if node["dialer-proxy"] != nil { throw policyFailure("中转节点不能再指定外部代理链。") }
         normalized.append(clean)
     }
-    let relayOnly = rules == relayOnlyRules
+    let relayOnly = baseRules == relayOnlyRules
     guard names.contains("静态IP出口") != relayOnly else { throw policyFailure("配置不符合静态出口服务的范围。") }
     guard choices[0] != "静态IP出口", names.contains(choices[0]) else { throw policyFailure("中转节点不存在。") }
-    let globalStatic = rules == globalStaticRules
+    let globalStatic = baseRules == globalStaticRules
     var dns: [String: Any] = [
         "enable": true, "listen": "127.0.0.1:17895", "ipv6": false,
         "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16",
@@ -182,7 +228,10 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         "nameserver-policy": ["geosite:cn": ["https://223.5.5.5/dns-query#DIRECT"]]
     ]
     // 全局静态模式下国内域名也经静态出口解析，与出口地区保持一致。
-    if globalStatic { dns["nameserver-policy"] = nil }
+    var policy: [String: Any] = globalStatic ? [:] : ["geosite:cn": ["https://223.5.5.5/dns-query#DIRECT"]]
+    // 白名单域名用国内 DNS 直连解析，与直连出口一致。
+    for domain in whitelistDomains { policy["+." + domain] = ["https://223.5.5.5/dns-query#DIRECT"] }
+    dns["nameserver-policy"] = policy.isEmpty ? nil : policy
     return [
         "external-controller-unix": networkServiceRoot + "/runtime/controller.sock", "secret": token,
         "mixed-port": 17896, "allow-lan": false, "bind-address": "127.0.0.1", "mode": "rule",
@@ -191,6 +240,6 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
         "tun": ["enable": true, "device": "utun78", "stack": "mixed", "auto-route": true,
                 // macOS 默认不注册系统 DNS；显式使用临时 resolver，避免浏览器继续查询局域网 DNS。
                 "auto-detect-interface": true, "strict-route": true, "dns-hijack": ["any:53", "tcp://any:53"], "dns-mode": "native"] as [String: Any],
-        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": relayOnly ? relayOnlyRules : (globalStatic ? globalStaticRules : staticExitRules)
+        "dns": dns, "proxies": normalized, "proxy-groups": groups, "rules": { var output = relayOnly ? relayOnlyRules : (globalStatic ? globalStaticRules : staticExitRules); output.insert(contentsOf: whitelist, at: whitelistIndex); return output }()
     ]
 }

@@ -178,6 +178,12 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
         if result.isEmpty { return [:] as [String: Any] }
         return try JSONSerialization.jsonObject(with: result)
     }
+    /// 断开内核当前跟踪的全部连接；失败不影响已生效的配置，旧连接自然结束后同样按新规则走。
+    func closeConnections() {
+        let secret = active?["secret"] as? String ?? ""
+        _ = try? command("/usr/bin/curl", ["-fsS", "--max-time", "3", "--unix-socket", runtime.appendingPathComponent("controller.sock").path,
+                                           "--header", "Authorization: Bearer " + secret, "-X", "DELETE", "http://localhost/connections"], timeout: 4)
+    }
     func nodeDelays(_ names: [String], secret: String, socket: String) -> [[String: Any]] {
         let results = DelayProbeResults(names: names)
         // 名称已在串行队列中按当时运行的配置校验；测速期间内核若被切换，未完成的探测只会记为失败。
@@ -245,6 +251,7 @@ final class NetworkService: NSObject, StaticExitNetworkProtocol, NSXPCListenerDe
                 active = config
                 try waitReady()
                 _ = try writeConfig(config, name: "active.json")
+                if shouldCloseConnections(previous: previous, next: config) { closeConnections() }
             } catch {
                 if let previous {
                     do {

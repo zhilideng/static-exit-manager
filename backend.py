@@ -654,11 +654,19 @@ def validate_proxy_fields(node):
     if not isinstance(node.get('server'), str) or not node['server'] or any(ch in node['server'] for ch in '/@ \r\n\t'):
         raise ValueError('订阅节点服务器地址不合法。')
     try:
+        if isinstance(node['port'], bool):
+            raise ValueError()
         port = int(node['port'])
         if not 1 <= port <= 65535:
             raise ValueError()
     except (KeyError, ValueError, TypeError):
         raise ValueError('订阅节点端口不合法。') from None
+    return port
+
+
+def numeric_ports(nodes):
+    # 部分机场把端口写成字符串 '601'；网络服务只接受数字端口，统一转换后再交给内核。
+    return [{**node, 'port': int(node['port'])} if isinstance(node.get('port'), str) else node for node in nodes]
 
 
 def normalize_subscription(config):
@@ -676,17 +684,24 @@ def normalize_subscription(config):
             raise ValueError('订阅包含重复的节点名称，请修正后导入。')
         if node['type'] in ('direct', 'reject', 'compatible'):
             continue
-        validate_proxy_fields(node)
+        port = validate_proxy_fields(node)
         names.add(name)
-        nodes.append(copy.deepcopy(node))
+        nodes.append({**copy.deepcopy(node), 'port': port})
     if not nodes:
         raise ValueError('订阅没有可用代理节点。')
     return {'proxies': nodes}
 
 
+INFO_NODE_WORDS = ('剩余', '重置', '到期', '官网', '发布页', '全红', '流量', '套餐',
+                   'expire', 'traffic', 'remaining', 'reset', 'website')
+# 「0 GB | 150 GB」这类用量信息节点：名称里带流量单位且含分隔符。
+INFO_NODE_USAGE = re.compile(r'\d+(\.\d+)?\s*[KMGT]i?B\s*[|/]', re.IGNORECASE)
+
+
 def available_nodes(config):
     names = [item['name'] for item in config.get('proxies', [])]
-    return [name for name in names if not any(word in name for word in ('剩余', '重置', '到期', '官网', '发布页', '全红', '流量', '套餐'))]
+    return [name for name in names
+            if not any(word in name.lower() for word in INFO_NODE_WORDS) and not INFO_NODE_USAGE.search(name)]
 
 
 def node_digest(node):
@@ -1149,7 +1164,7 @@ def generate_config(config, profile, relay, preferences):
                     'nameserver': ['https://1.1.1.1/dns-query'],
                     'proxy-server-nameserver': [DOMESTIC_DOH],
                     **({'nameserver-policy': policy} if policy else {})},
-            'proxies': copy.deepcopy(config['proxies']) + ([static_proxy(profile)] if profile else []),
+            'proxies': numeric_ports(copy.deepcopy(config['proxies'])) + ([static_proxy(profile)] if profile else []),
             'proxy-groups': [{'name': RELAY_NAME, 'type': 'select', 'proxies': [relay]}],
             'rules': rules}
 

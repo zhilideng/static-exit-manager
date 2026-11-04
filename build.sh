@@ -3,8 +3,8 @@
 # 用法：./build.sh [目标目录]，默认安装到 ~/Applications。
 set -eu
 cd "$(dirname "$0")"
-VERSION=0.3.15
-BUILD=20
+VERSION=0.3.16
+BUILD=21
 DEST="${1:-$HOME/Applications}"
 # 独立 Python 来自 uv 管理的 python-build-standalone；也可用 PYTHON_HOME 指定解压后的根目录。
 PYTHON_HOME="${PYTHON_HOME:-$(dirname "$(dirname "$(realpath "$(uv python find --managed-python 3.12)")")")}"

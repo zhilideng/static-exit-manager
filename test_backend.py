@@ -524,6 +524,27 @@ class BackendTests(unittest.TestCase):
             with self.assertRaises(ValueError): b.normalize_subscription(source)
         with self.assertRaises(ValueError): b.normalize_subscription({'proxy-providers': {'only': {}}})
 
+    def test_subscription_string_port_becomes_integer(self):
+        source = copy.deepcopy(self.source)
+        source['proxies'][0]['port'] = '601'
+        self.assertEqual(b.normalize_subscription(source)['proxies'][0]['port'], 601)
+        for port in ('abc', '0', '65536', True):
+            source['proxies'][0]['port'] = port
+            with self.assertRaises(ValueError): b.normalize_subscription(source)
+
+    def test_generated_config_converts_cached_string_ports(self):
+        source = copy.deepcopy(self.source)
+        source['proxies'][0]['port'] = '601'
+        config = b.generate_config(source, None, '日本一', {'controller_secret': 'A' * 48})
+        self.assertEqual(config['proxies'][0]['port'], 601)
+        self.assertEqual(source['proxies'][0]['port'], '601')
+
+    def test_english_info_nodes_are_not_relay_choices(self):
+        names = ['0 GB | 150 GB', '12.5 GiB / 200 GiB', 'Expire Date: 2027-02-03', 'Traffic Reset: 3 Days',
+                 '🇭🇰 Hong Kong丨01', '🇺🇸 United States丨01', '香港 10G 专线']
+        source = {'proxies': [{'name': name} for name in names]}
+        self.assertEqual(b.available_nodes(source), ['🇭🇰 Hong Kong丨01', '🇺🇸 United States丨01', '香港 10G 专线'])
+
     def test_subscription_name_prefers_plain_or_base64_provider_title(self):
         for title in ('示例机场.yaml', 'base64:' + b.base64.b64encode('示例机场.yaml'.encode()).decode()):
             result = b.subscription_response_name({'profile-title': title, 'content-disposition': 'attachment; filename="other.yml"'}, self.item['url'])

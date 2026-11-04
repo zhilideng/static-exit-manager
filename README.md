@@ -4,103 +4,87 @@
 
 <h1 align="center">静态出口管理器</h1>
 
-<p align="center">macOS 上的静态 IP 出口管理工具：国内直连，国外 TCP 经机场中转连接你的静态出口。内置 Mihomo 内核，不需要 Clash Verge。</p>
+<p align="center"><b>中文</b> | <a href="README.en.md">English</a></p>
+
+<p align="center">macOS 上的静态 IP 出口管理工具：国内直连，国外流量经机场中转、从你自己的静态 IP 出去。<br>内置 Mihomo 内核，开箱即用，不需要 Clash Verge。</p>
 
 <p align="center">
-  <a href="../../releases/latest"><b>下载最新版本</b></a>
+  <a href="../../releases/latest"><b>⬇ 下载最新版本</b></a>
 </p>
 
 ## 界面预览
 
-![已连接状态：显示实测公网出口、出口地点、静态 IP 库与中转节点](docs/screenshot.png)
+![连接概览：当前公网出口、中转节点、出口设置与静态 IP 库](docs/screenshot.png)
 
-- **左侧**：机场订阅列表与当前套餐的已用流量、总量和到期日；「更新节点」拉取最新节点配置。
-- **当前公网出口**：连接后显示实测出口 IP 与所在地点，「已验证连接」表示静态出口、系统 TUN 和 DNS 接管均已核实。
-- **静态 IP 库**：保存的静态 IP，可导入服务商 CSV 或手动添加，选中一条作为出口。
-- **中转节点**：选择经由的机场节点并显示延迟；已连接时切换节点或静态 IP 会自动重连。
-- **底部状态栏**：显示最近一次操作结果和连接耗时。
+> 截图中的订阅名称和 IP 均为示例数据。
 
-> 截图中的订阅、用量、IP 与地点均为示例数据。
+## 它能做什么
+
+很多服务会根据 IP 判断账号风险，频繁换 IP 容易触发验证甚至封号。静态出口管理器让你的海外流量始终从同一个静态 IP 出去，同时尽量不影响国内访问速度：
+
+- **国内直连**：国内网站和局域网不绕路，速度不受影响。
+- **国外经静态 IP**：国外 TCP 流量经机场节点中转，最终从你的静态 IP（SOCKS5）出去。
+- **出口实测**：每次连接都实测公网出口 IP 和所在地点；静态出口、系统 TUN 和 DNS 接管都核实通过后，才显示「已连接」。
 
 ## 功能
 
-- 管理机场订阅（远程链接或 Clash/Mihomo YAML），显示已用流量、总量和到期日。
-- 管理静态 IP（SOCKS5），密码保存在 macOS 钥匙串。
-- 选择中转节点，后台每 10 分钟自动测速；已连接时切换节点或静态 IP 会自动重连并验证出口，失败自动恢复。
-- TUN 模式接管系统流量：国内与局域网直连，国外 TCP 经“机场 → 静态 IP”出口，并显示实测公网出口 IP 与地点。
-- 连接期间临时接管 DNS，停止后恢复；不修改永久系统代理与 DNS 设置。
-- 可一次性迁移本机 Clash Verge 的订阅和静态出口。
-- 未选择静态 IP 时，可只用中转节点连接。
-- 直连白名单：填入域名、网址或 IP/网段，命中的流量在任何模式下都用本机网络直连，不经静态 IP 和中转节点；修改后立即生效并断开旧连接。
-- 启动时自动检查更新（每 24 小时最多一次），也可在设置菜单手动检查；一键下载、校验并替换应用。
+**订阅与节点**
+- 支持机场订阅链接或 Clash/Mihomo YAML，显示已用流量、套餐总量、到期日和剩余天数。
+- 中转节点后台自动测速，可以测当前节点，也可以一键测全部节点；已连接时切换节点会自动重连，并重新验证出口。
+- 可以一次性迁移本机 Clash Verge 的订阅和静态出口。
+
+**静态 IP 库**
+- 管理多个静态 IP，支持导入服务商 CSV 或手动添加，密码保存在 macOS 钥匙串里。
+- 按「可用 / 即将到期 / 已过期」筛选和排序，到期前会提醒剩余天数。
+- 不选静态 IP 时，也可以只用中转节点连接。
+
+**出口设置**
+- **国内也走静态 IP**：除本机和局域网以外，所有流量都经静态出口。
+- **时区跟随出口**：连接期间系统时区自动设为出口 IP 所在地，断开后恢复。
+- **Chrome 英文语言**：把 Chrome 的界面语言和网页请求语言切换为英文，可以随时还原。
+- **直连白名单**：命中的域名或 IP 始终用本机网络直连，修改后立即生效。
+
+**省心**
+- 连接期间临时接管系统流量和 DNS，断开后完全恢复，不改动永久的系统代理和 DNS 设置。
+- 切换失败会自动恢复上一次可用的配置。
+- 内置检查更新，一键下载、校验并替换应用。
 
 ## 系统要求
 
 - Apple Silicon（M 系列芯片）Mac
 - macOS 14 及以上
 
-无需安装 Python、Ruby 或其他软件。
+不需要另外安装 Python、Clash 或其他软件。
 
 ## 安装
 
 1. 在 [Releases](../../releases/latest) 下载 `StaticExitManager-<版本>-arm64.dmg`。
-2. 打开 dmg，把「静态出口管理器独立版」拖到「Applications（应用程序）」。
-3. 打开应用。应用未经 Apple 公证，首次打开会提示无法验证开发者：
-   前往「系统设置 → 隐私与安全性」，在页面下方点「仍要打开」。
-4. 在应用中点「安装网络服务」，输入一次电脑登录密码。
+2. 打开 dmg，把「静态出口管理器独立版」拖进「应用程序」。
+3. 首次打开时，系统如果提示无法验证开发者，到「系统设置 → 隐私与安全性」，点页面下方的「仍要打开」。
+4. 在应用里点「安装网络服务」，输入一次电脑登录密码。
 
 ## 使用
 
 1. 先关闭其他 VPN 的 TUN 模式和系统代理。
-2. 添加机场订阅链接、导入 YAML，或迁移 Clash Verge 配置。
-3. 添加静态 IP，选择订阅、静态 IP 与中转节点，点「开始连接」。
-4. 「停止连接」会退出内核并释放 TUN。关闭窗口不会断开连接；重启电脑后不会自动连接。
+2. 添加机场订阅，或迁移 Clash Verge 的配置。
+3. 添加静态 IP，选好中转节点后点「连接」。
+4. 「断开连接」会释放所有接管。关闭窗口不会断开连接；重启电脑后不会自动连接。
 
-## 数据与隐私
+## 隐私
 
-| 内容 | 位置 |
-|---|---|
-| 静态 IP 信息 | `~/Library/Application Support/StaticExitManager/profiles.json` |
-| 静态 IP 密码 | macOS 钥匙串 |
-| 订阅、节点缓存、选择、备份、诊断日志 | `~/Library/Application Support/StaticExitManager/standalone/` |
-| 网络服务与内核运行目录 | `/Library/Application Support/StaticExitManagerService/` |
+- 所有数据只保存在本机，没有遥测，也没有云同步；静态 IP 的密码存放在 macOS 钥匙串。
+- 只有在查询出口地点时，才会把公网出口 IP 发给 [ipwho.is](https://ipwhois.io/)，不会发送订阅、账号或密码。
 
-- 所有数据只保存在本机，没有遥测或云同步。
-- 连接成功后会把公网出口 IP 发送给 [ipwho.is](https://ipwhois.io/) 查询地点，不发送订阅、账号或密码。
-- 出口检测访问 `1.1.1.1`、`1.0.0.1` 的 trace 页面，必要时访问 `api.ipify.org`、`icanhazip.com`。
+## 已知限制
 
-## 工作方式
-
-- **界面**（SwiftUI）以普通用户权限运行，调用应用内置的独立 Python 后台处理订阅、配置生成和出口检测。
-- **网络服务**（`/Library/PrivilegedHelperTools/local.staticexit.network`）以 root 运行，只负责内置 Mihomo 内核的校验、启动、重载和停止。它只接受安装时的用户和这份应用的签名；重新安装或更新应用后，需要在应用中重新安装网络服务。
-- 内核控制接口为 root 私有 Unix socket；HTTP/SOCKS 混合端口只监听 `127.0.0.1:17896`。
-
-## 限制
-
-- 国外 UDP 和未匹配直连规则的公网 IPv6 会被拒绝。
-- 只支持包含 `proxies` 列表的 Clash/Mihomo YAML 订阅；暂不支持仅 `proxy-providers`、Base64 通用链接或需要插件的订阅。
+- 国外 UDP 和公网 IPv6 会被拦截（直连白名单内的除外），防止绕过静态出口。
+- 只支持带 `proxies` 列表的 Clash/Mihomo YAML 订阅。
 - 不提供断线锁网。
-
-## 从源码构建
-
-```sh
-uv python install 3.12   # 准备独立 Python（python-build-standalone）
-./build.sh               # 构建并安装到 ~/Applications
-./make_dmg.sh            # 生成 dist/StaticExitManager-<版本>-arm64.dmg
-```
-
-运行测试：
-
-```sh
-python3 -m unittest test_backend test_connection_parallel test_validation_cache test_exit_location
-```
 
 ## 第三方组件
 
-- [Mihomo](https://github.com/MetaCubeX/mihomo) v1.19.33（GPL-3.0），官方发布包校验值见 `vendor/manifest.json`，许可证见 `vendor/LICENSE-mihomo`
-- [Python](https://www.python.org/) 3.12（PSF License），来自 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
-- [PyYAML](https://github.com/yaml/pyyaml) 6.0.3（MIT），见 `vendor/pylib/LICENSE-pyyaml`
+[Mihomo](https://github.com/MetaCubeX/mihomo)（GPL-3.0）、[Python](https://www.python.org/)（PSF License）、[PyYAML](https://github.com/yaml/pyyaml)（MIT）。
 
 ## 免责声明
 
-本项目仅供学习与个人网络管理使用。请遵守所在地法律法规。
+本项目仅供学习和个人网络管理使用，请遵守所在地的法律法规。

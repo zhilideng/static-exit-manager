@@ -93,6 +93,20 @@ for bad in ["DOMAIN-SUFFIX,example.com,静态IP出口", "DOMAIN-SUFFIX,a.com,DIR
             "IP-CIDR,1.2.3.4/32,DIRECT", "MATCH,DIRECT", "DOMAIN-SUFFIX,com,DIRECT"] {
     rejects("白名单格式外规则：" + bad) { $0["rules"] = withWhitelist(staticExitRules, [bad]) }
 }
+// 应用白名单：只接受按同一规则转义的 .app 路径前缀，并据此开启进程查找。
+do { let app = #"PROCESS-PATH-REGEX,^/Applications/C\+\+ \(beta\)\.app/,DIRECT"#
+     var input = fixture(); input["rules"] = withWhitelist(staticExitRules, [app, "PROCESS-PATH-REGEX,^/Applications/企业微信\\.app/,DIRECT"])
+     let result = try restrictedConfiguration(input)
+     check(result["find-process-mode"] as? String == "strict", "含应用白名单未开启进程查找")
+     check(whitelistAppPath(app) == "/Applications/C++ (beta).app", "应用路径还原错误")
+     check(output["find-process-mode"] as? String == "off", "无应用白名单时开启了进程查找") }
+for bad in [#"PROCESS-PATH-REGEX,^/Applications/.*\.app/,DIRECT"#, #"PROCESS-PATH-REGEX,^/Applications/WeChat\.app/,静态IP出口"#,
+            #"PROCESS-PATH-REGEX,^/Applications/WeChat.app/,DIRECT"#, #"PROCESS-PATH-REGEX,^/Applications/../x\.app/,DIRECT"#,
+            #"PROCESS-PATH-REGEX,^/usr/bin/git/,DIRECT"#, #"PROCESS-PATH-REGEX,/Applications/WeChat\.app/,DIRECT"#,
+            #"PROCESS-PATH-REGEX,^/Applications/WeChat\.app,DIRECT"#, #"PROCESS-PATH-REGEX,^/Applications/W\eChat\.app/,DIRECT"#,
+            #"PROCESS-NAME,WeChat,DIRECT"#, #"PROCESS-PATH-REGEX,^/Applications//WeChat\.app/,DIRECT"#] {
+    rejects("应用白名单格式外规则：" + bad) { $0["rules"] = withWhitelist(staticExitRules, [bad]) }
+}
 rejects("白名单插在固定规则之后") { var rules = staticExitRules; rules.insert("DOMAIN-SUFFIX,example.com,DIRECT", at: 13); $0["rules"] = rules }
 rejects("白名单重复") { $0["rules"] = withWhitelist(staticExitRules, [whitelist[0], whitelist[0]]) }
 rejects("白名单超过上限") { $0["rules"] = withWhitelist(staticExitRules, (0...whitelistLimit).map { "DOMAIN-SUFFIX,h\($0).example.com,DIRECT" }) }

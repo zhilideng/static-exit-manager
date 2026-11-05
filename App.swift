@@ -1,5 +1,6 @@
 import SwiftUI
 import Security
+import UniformTypeIdentifiers
 
 private func writeJSON(_ value: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: value) {
@@ -1711,14 +1712,14 @@ struct ContentView: View {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("直连白名单").font(.system(size: 13, weight: .semibold))
-                            Text(model.directWhitelist.isEmpty ? "命中的网站与 IP 用本机网络直连，不经静态 IP 和中转节点" : "\(model.directWhitelist.count) 条 · " + model.directWhitelist.prefix(3).joined(separator: "、") + (model.directWhitelist.count > 3 ? "…" : ""))
+                            Text(model.directWhitelist.isEmpty ? "命中的网站与 IP 用本机网络直连，不经静态 IP 和中转节点" : "\(model.directWhitelist.count) 条 · " + model.directWhitelist.prefix(3).map { $0.hasPrefix("/") ? URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent : $0 }.joined(separator: "、") + (model.directWhitelist.count > 3 ? "…" : ""))
                                 .font(.system(size: 11)).foregroundStyle(Palette.text2).lineLimit(1).truncationMode(.tail)
                         }
                         Spacer(minLength: 8)
                         Button("编辑") { editingWhitelist = true }.controlSize(.small).disabled(locked)
                     }.padding(.horizontal, 16).padding(.vertical, 11)
                         .frame(maxWidth: .infinity, alignment: .leading).gridCellColumns(2)
-                        .help("填入的域名（含子域名）与 IP/网段在所有模式下都直接使用本机网络，TCP 与 UDP 均放行，域名用国内 DNS 解析。")
+                        .help("填入的域名（含子域名）、IP/网段与应用在所有模式下都直接使用本机网络，TCP 与 UDP 均放行，域名用国内 DNS 解析。")
                 }
             }.background(Palette.surface, in: RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Palette.border))
@@ -1818,24 +1819,29 @@ struct WhitelistView: View {
     @ObservedObject var model: Model
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
+    /// 应用路径可能含空格与逗号，整行保留；其余行可用逗号或空格分隔多条。
     private var entries: [String] {
-        text.split(whereSeparator: { $0.isNewline || $0 == "," || $0 == "，" || $0 == " " })
-            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        text.split(whereSeparator: \.isNewline).flatMap { line -> [String] in
+            let value = line.trimmingCharacters(in: .whitespaces)
+            if value.hasPrefix("/") { return [value] }
+            return value.split(whereSeparator: { $0 == "," || $0 == "，" || $0 == " " }).map(String.init)
+        }.filter { !$0.isEmpty }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("直连白名单").font(.title2.bold())
-            Text("每行一个域名、网址或 IP/网段。命中的流量用本机网络直连，不经静态 IP 和中转节点。")
+            Text("每行一个域名、网址、IP/网段或应用。命中的流量用本机网络直连，不经静态 IP 和中转节点。")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             TextEditor(text: $text)
                 .font(.system(size: 13, design: .monospaced)).frame(height: 220)
                 .scrollContentBackground(.hidden).padding(6)
                 .background(Palette.surface, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Palette.border))
-            Text("例：example.com（含所有子域名）、https://a.example.com/path、203.0.113.5、203.0.113.0/24。已连接时保存会立即重新应用并验证。")
+            Text("例：example.com（含所有子域名）、https://a.example.com/path、203.0.113.5、203.0.113.0/24。应用含其全部子进程，但其域名解析无法按应用区分。已连接时保存会立即重新应用并验证。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if model.error { Text(model.message).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             HStack {
+                Button("添加应用…") { addApps() }
                 Text("\(entries.count) 条").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("取消") { dismiss() }
@@ -1844,6 +1850,20 @@ struct WhitelistView: View {
             }.disabled(model.busy)
         }.padding(24).frame(width: 480)
             .onAppear { text = model.directWhitelist.joined(separator: "\n") }
+    }
+
+    private func addApps() {
+        let panel = NSOpenPanel()
+        panel.title = "选择直连的应用"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return }
+        let existing = Set(entries)
+        let paths = panel.urls.map { $0.standardizedFileURL.path }.filter { !existing.contains($0) }
+        guard !paths.isEmpty else { return }
+        text += (text.isEmpty || text.hasSuffix("\n") ? "" : "\n") + paths.joined(separator: "\n")
     }
 }
 

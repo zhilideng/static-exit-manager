@@ -106,6 +106,17 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             b.normalize_whitelist(['example.com', 'not a host'])
 
+    def test_whitelist_apps_match_bundle_and_enable_process_lookup(self):
+        self.assertEqual(b.whitelist_entry('/Applications/Google Chrome.app/'), '/Applications/Google Chrome.app')
+        for raw in ('/Applications/a,b.app', '/Applications/../x.app', '/usr/bin/git', '/Applications//x.app'):
+            self.assertIsNone(b.whitelist_entry(raw), raw)
+        self.assertEqual(b.process_rule('/Applications/C++ (beta).app'), r'PROCESS-PATH-REGEX,^/Applications/C\+\+ \(beta\)\.app/,DIRECT')
+        result = b.generate_config(self.source, self.profile, '日本一', {**self.preferences, 'direct_whitelist': ['/Applications/WeChat.app', 'example.com']})
+        self.assertEqual(result['rules'][11:13], [r'PROCESS-PATH-REGEX,^/Applications/WeChat\.app/,DIRECT', 'DOMAIN-SUFFIX,example.com,DIRECT'])
+        self.assertEqual(result['find-process-mode'], 'strict')
+        self.assertEqual(b.base_rules(result['rules']), b.RULES)
+        self.assertEqual(b.generate_config(self.source, self.profile, '日本一', self.preferences)['find-process-mode'], 'off')
+
     def test_whitelist_goes_direct_before_static_and_relay_rules_in_every_mode(self):
         entries = ['example.com', '203.0.113.0/24', '198.51.100.7']
         expected = ['DOMAIN-SUFFIX,example.com,DIRECT', 'IP-CIDR,203.0.113.0/24,DIRECT,no-resolve', 'IP-CIDR,198.51.100.7/32,DIRECT,no-resolve']

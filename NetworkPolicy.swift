@@ -26,8 +26,29 @@ let whitelistLimit = 500
 private let whitelistDomainPattern = try! NSRegularExpression(pattern: "^DOMAIN-SUFFIX,((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?),DIRECT$")
 private let whitelistNetwork = try! NSRegularExpression(pattern: "^(IP-CIDR|IP-CIDR6),([0-9a-f.:]+)/([0-9]{1,3}),DIRECT,no-resolve$")
 
-/// 合法白名单规则返回其域名（IP 规则返回空字符串），否则返回 nil。
+private let regexSpecial = Set("\\.+*?()|[]{}^$")
+
+/// 应用规则：PROCESS-PATH-REGEX,^<转义后的 .app 路径>/,DIRECT。还原路径后逐项校验，再按同一规则转义比对，
+/// 只能匹配一个具体应用目录，不能写入任意正则。
+func whitelistAppPath(_ rule: String) -> String? {
+    let prefix = "PROCESS-PATH-REGEX,^", suffix = "/,DIRECT"
+    guard rule.hasPrefix(prefix), rule.hasSuffix(suffix), rule.utf8.count <= 2100 else { return nil }
+    let escaped = rule.dropFirst(prefix.count).dropLast(suffix.count)
+    var path = "", pending = false
+    for char in escaped {
+        if pending { guard regexSpecial.contains(char) else { return nil }; path.append(char); pending = false }
+        else if char == "\\" { pending = true }
+        else { guard !regexSpecial.contains(char) else { return nil }; path.append(char) }
+    }
+    let parts = path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+    guard !pending, path.hasPrefix("/"), path.hasSuffix(".app"), path.utf8.count <= 1024, !path.contains(","),
+          cleanString(path, max: 1024, empty: false), parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
+    return path
+}
+
+/// 合法白名单规则返回其域名（IP 与应用规则返回空字符串），否则返回 nil。
 func whitelistDomain(_ rule: String) -> String? {
+    if whitelistAppPath(rule) != nil { return "" }
     let range = NSRange(rule.startIndex..., in: rule)
     if let match = whitelistDomainPattern.firstMatch(in: rule, range: range), let domain = Range(match.range(at: 1), in: rule) {
         return rule[domain].utf8.count <= 253 ? String(rule[domain]) : nil
@@ -232,10 +253,12 @@ func restrictedConfiguration(_ input: [String: Any]) throws -> [String: Any] {
     // 白名单域名用国内 DNS 直连解析，与直连出口一致。
     for domain in whitelistDomains { policy["+." + domain] = ["https://223.5.5.5/dns-query#DIRECT"] }
     dns["nameserver-policy"] = policy.isEmpty ? nil : policy
+    // 白名单含应用时才按连接查找进程。
+    let findProcess = whitelist.contains { whitelistAppPath($0) != nil } ? "strict" : "off"
     return [
         "external-controller-unix": networkServiceRoot + "/runtime/controller.sock", "secret": token,
         "mixed-port": 17896, "allow-lan": false, "bind-address": "127.0.0.1", "mode": "rule",
-        "ipv6": false, "find-process-mode": "off", "geo-auto-update": false, "geodata-mode": false, "tcp-concurrent": true, "unified-delay": true,
+        "ipv6": false, "find-process-mode": findProcess, "geo-auto-update": false, "geodata-mode": false, "tcp-concurrent": true, "unified-delay": true,
         "log-level": "silent", "profile": ["store-selected": false, "store-fake-ip": false],
         "tun": ["enable": true, "device": "utun78", "stack": "mixed", "auto-route": true,
                 // macOS 默认不注册系统 DNS；显式使用临时 resolver，避免浏览器继续查询局域网 DNS。

@@ -72,6 +72,9 @@ GLOBAL_STATIC_RULES = RULES[:11] + RULES[-3:]
 WHITELIST_INDEX = 11
 WHITELIST_LIMIT = 500
 DOMESTIC_DOH = 'https://223.5.5.5/dns-query#DIRECT'
+# 应用按 .app 路径前缀匹配，含其全部子进程；路径不得含逗号（规则分隔符）与控制字符。
+APP_PATH_PATTERN = re.compile(r'^(?:/[^/\x00-\x1f\x7f,]+)+\.app$')
+REGEX_SPECIAL = frozenset('\\.+*?()|[]{}^$')
 DOMAIN_PATTERN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
 
 
@@ -1062,8 +1065,22 @@ def static_proxy(profile):
     return proxy
 
 
+def app_entry(text):
+    path = str(text).strip().rstrip('/')
+    if len(path.encode()) > 1024 or not APP_PATH_PATTERN.match(path) or any(part in ('.', '..') for part in path.split('/')):
+        return None
+    return path
+
+
+def process_rule(path):
+    """应用路径转为进程路径正则：转义全部正则元字符，锚定开头并要求路径分隔符，避免误配同名前缀。"""
+    return 'PROCESS-PATH-REGEX,^' + ''.join('\\' + char if char in REGEX_SPECIAL else char for char in path) + '/,DIRECT'
+
+
 def whitelist_entry(text):
-    """把一行输入规范化为域名或 IP/网段；网址取主机名，*.、前导点与端口忽略。无法识别返回 None。"""
+    """把一行输入规范化为 .app 路径、域名或 IP/网段；网址取主机名，*.、前导点与端口忽略。无法识别返回 None。"""
+    if str(text).strip().startswith('/'):
+        return app_entry(text)
     value = str(text).strip().lower()
     if not value or len(value) > 2048:
         return None
@@ -1113,6 +1130,11 @@ def normalize_whitelist(entries):
 def whitelist_rules(entries):
     rules, domains = [], []
     for entry in entries:
+        if str(entry).startswith('/'):
+            path = app_entry(entry)
+            if path is not None:
+                rules.append(process_rule(path))
+            continue
         try:
             network = ipaddress.ip_network(entry, strict=False)
         except ValueError:
@@ -1130,7 +1152,7 @@ def whitelist_rules(entries):
 def base_rules(rules):
     """去掉白名单规则，得到三种固定模式之一，用于判断当前模式。"""
     return rules[:WHITELIST_INDEX] + [rule for rule in rules[WHITELIST_INDEX:]
-                                      if not rule.startswith(('DOMAIN-SUFFIX,', 'IP-CIDR,', 'IP-CIDR6,')) or rule == 'IP-CIDR6,::/0,REJECT,no-resolve']
+                                      if not rule.startswith(('DOMAIN-SUFFIX,', 'IP-CIDR,', 'IP-CIDR6,', 'PROCESS-PATH-REGEX,')) or rule == 'IP-CIDR6,::/0,REJECT,no-resolve']
 
 
 def generate_config(config, profile, relay, preferences):
@@ -1150,7 +1172,9 @@ def generate_config(config, profile, relay, preferences):
     policy.update({'+.' + domain: [DOMESTIC_DOH] for domain in domains})
     return {'mixed-port': MIXED_PORT, 'allow-lan': False, 'bind-address': '127.0.0.1',
             'secret': token,
-            'mode': 'rule', 'ipv6': False, 'log-level': 'warning', 'find-process-mode': 'off',
+            # 只有白名单含应用时才按连接查找进程，其余情况不增加开销。
+            'mode': 'rule', 'ipv6': False, 'log-level': 'warning',
+            'find-process-mode': 'strict' if any(rule.startswith('PROCESS-') for rule in direct) else 'off',
             'tcp-concurrent': True, 'unified-delay': True,
             'geodata-mode': False, 'geo-auto-update': False,
             'profile': {'store-selected': False, 'store-fake-ip': False},

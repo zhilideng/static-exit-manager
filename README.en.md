@@ -42,7 +42,7 @@ Many services judge account risk by IP address, and switching IPs too often can 
 - **Route domestic traffic through the static IP too**: everything except local and LAN traffic exits from the static IP.
 - **Time zone follows the exit**: while connected, the system time zone matches the exit IP's location, and is restored when you disconnect.
 - **Chrome in English**: switches Chrome's interface language and the language it requests from websites to English. You can revert it at any time.
-- **Direct-connection allowlist**: listed domains and IPs always use your local network directly. Changes take effect immediately.
+- **Direct-connection allowlist**: listed domains, IPs and apps (including all their helper processes) always use your local network directly. Changes take effect immediately.
 
 **Hassle-free**
 - Takes over system traffic and DNS only while connected, and fully restores them afterwards. Permanent system proxy and DNS settings are never changed.

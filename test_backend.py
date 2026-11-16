@@ -117,6 +117,16 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(b.base_rules(result['rules']), b.RULES)
         self.assertEqual(b.generate_config(self.source, self.profile, '日本一', self.preferences)['find-process-mode'], 'off')
 
+    def test_whitelist_wildcards_route_direct_without_dns_policy(self):
+        self.assertEqual(b.whitelist_entry('SuperEvaluation*.NHDISZ.cn'), 'superevaluation*.nhdisz.cn')
+        self.assertEqual(b.whitelist_entry('*.example.com'), 'example.com')
+        for raw in ('*.com', 'example.*', '*', 'a*b.c', 'https://x*.a.com/p'):
+            self.assertIsNone(b.whitelist_entry(raw), raw)
+        result = b.generate_config(self.source, self.profile, '日本一', {**self.preferences, 'direct_whitelist': ['superevaluation*.nhdisz.cn']})
+        self.assertEqual(result['rules'][11], 'DOMAIN-WILDCARD,superevaluation*.nhdisz.cn,DIRECT')
+        self.assertEqual(result['dns']['nameserver-policy'], {'geosite:cn': ['https://223.5.5.5/dns-query#DIRECT']})
+        self.assertEqual(b.base_rules(result['rules']), b.RULES)
+
     def test_whitelist_goes_direct_before_static_and_relay_rules_in_every_mode(self):
         entries = ['example.com', '203.0.113.0/24', '198.51.100.7']
         expected = ['DOMAIN-SUFFIX,example.com,DIRECT', 'IP-CIDR,203.0.113.0/24,DIRECT,no-resolve', 'IP-CIDR,198.51.100.7/32,DIRECT,no-resolve']

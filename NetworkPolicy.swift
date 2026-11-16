@@ -46,9 +46,23 @@ func whitelistAppPath(_ rule: String) -> String? {
     return path
 }
 
-/// 合法白名单规则返回其域名（IP 与应用规则返回空字符串），否则返回 nil。
+/// 通配符规则：DOMAIN-WILDCARD,<模式>,DIRECT。只含小写字母、数字、点、连字符、* 与 ?，
+/// 最后一个通配符之后须是至少两段的合法域名，拒绝 *.com 这类过宽的写法。
+func whitelistWildcard(_ rule: String) -> String? {
+    let prefix = "DOMAIN-WILDCARD,", suffix = ",DIRECT"
+    guard rule.hasPrefix(prefix), rule.hasSuffix(suffix) else { return nil }
+    let pattern = String(rule.dropFirst(prefix.count).dropLast(suffix.count))
+    let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789.-*?")
+    guard (1...253).contains(pattern.utf8.count), pattern.allSatisfy(allowed.contains),
+          let last = pattern.lastIndex(where: { $0 == "*" || $0 == "?" }) else { return nil }
+    let tail = pattern[pattern.index(after: last)...]
+    guard tail.hasPrefix("."), let domain = whitelistDomain("DOMAIN-SUFFIX," + tail.dropFirst() + ",DIRECT"), !domain.isEmpty else { return nil }
+    return pattern
+}
+
+/// 合法白名单规则返回其域名（IP、应用与通配符规则返回空字符串），否则返回 nil。
 func whitelistDomain(_ rule: String) -> String? {
-    if whitelistAppPath(rule) != nil { return "" }
+    if whitelistAppPath(rule) != nil || whitelistWildcard(rule) != nil { return "" }
     let range = NSRange(rule.startIndex..., in: rule)
     if let match = whitelistDomainPattern.firstMatch(in: rule, range: range), let domain = Range(match.range(at: 1), in: rule) {
         return rule[domain].utf8.count <= 253 ? String(rule[domain]) : nil

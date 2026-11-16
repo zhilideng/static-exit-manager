@@ -1837,7 +1837,7 @@ struct WhitelistView: View {
                 .scrollContentBackground(.hidden).padding(6)
                 .background(Palette.surface, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Palette.border))
-            Text("例：example.com（含所有子域名）、https://a.example.com/path、203.0.113.5、203.0.113.0/24。应用含其全部子进程，但其域名解析无法按应用区分。已连接时保存会立即重新应用并验证。")
+            Text("例：example.com（含所有子域名）、https://a.example.com/path、203.0.113.5、203.0.113.0/24；通配符 superevaluation*.nhdisz.cn（* 任意字符，? 单个字符，DNS 不走国内）。应用含其全部子进程，但其域名解析无法按应用区分。已连接时保存会立即重新应用并验证。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if model.error { Text(model.message).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
             HStack {

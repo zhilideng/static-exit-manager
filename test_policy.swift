@@ -107,6 +107,15 @@ for bad in [#"PROCESS-PATH-REGEX,^/Applications/.*\.app/,DIRECT"#, #"PROCESS-PAT
             #"PROCESS-NAME,WeChat,DIRECT"#, #"PROCESS-PATH-REGEX,^/Applications//WeChat\.app/,DIRECT"#] {
     rejects("应用白名单格式外规则：" + bad) { $0["rules"] = withWhitelist(staticExitRules, [bad]) }
 }
+// 通配符白名单：只决定路由，不进入 DNS 策略；过宽或含其他字符的模式一律拒绝。
+do { var input = fixture(); input["rules"] = withWhitelist(staticExitRules, ["DOMAIN-WILDCARD,superevaluation*.nhdisz.cn,DIRECT", "DOMAIN-WILDCARD,api?.example.com,DIRECT"])
+     let result = try restrictedConfiguration(input)
+     check((result["rules"] as! [String])[11] == "DOMAIN-WILDCARD,superevaluation*.nhdisz.cn,DIRECT", "通配符规则未保留")
+     check(((result["dns"] as! [String: Any])["nameserver-policy"] as! [String: Any]).count == 1, "通配符进入了 DNS 策略") }
+for bad in ["DOMAIN-WILDCARD,*.com,DIRECT", "DOMAIN-WILDCARD,example.*,DIRECT", "DOMAIN-WILDCARD,*,DIRECT", "DOMAIN-WILDCARD,api*.Example.com,DIRECT",
+            "DOMAIN-WILDCARD,a*.b.c/d,DIRECT", "DOMAIN-WILDCARD,a*.example.com,静态IP出口", "DOMAIN-WILDCARD,example.com,DIRECT", "DOMAIN-WILDCARD,a*com,DIRECT"] {
+    rejects("通配符格式外规则：" + bad) { $0["rules"] = withWhitelist(staticExitRules, [bad]) }
+}
 rejects("白名单插在固定规则之后") { var rules = staticExitRules; rules.insert("DOMAIN-SUFFIX,example.com,DIRECT", at: 13); $0["rules"] = rules }
 rejects("白名单重复") { $0["rules"] = withWhitelist(staticExitRules, [whitelist[0], whitelist[0]]) }
 rejects("白名单超过上限") { $0["rules"] = withWhitelist(staticExitRules, (0...whitelistLimit).map { "DOMAIN-SUFFIX,h\($0).example.com,DIRECT" }) }

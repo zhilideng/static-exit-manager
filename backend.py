@@ -75,6 +75,8 @@ DOMESTIC_DOH = 'https://223.5.5.5/dns-query#DIRECT'
 # 应用按 .app 路径前缀匹配，含其全部子进程；路径不得含逗号（规则分隔符）与控制字符。
 APP_PATH_PATTERN = re.compile(r'^(?:/[^/\x00-\x1f\x7f,]+)+\.app$')
 REGEX_SPECIAL = frozenset('\\.+*?()|[]{}^$')
+# 通配符域名：* 匹配任意字符（可跨越点号），? 匹配单个字符；最后一个通配符之后须是至少两段的固定域名。
+WILDCARD_PATTERN = re.compile(r'^[a-z0-9.*?-]{1,253}$')
 DOMAIN_PATTERN = re.compile(r'^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
 
 
@@ -1077,6 +1079,15 @@ def process_rule(path):
     return 'PROCESS-PATH-REGEX,^' + ''.join('\\' + char if char in REGEX_SPECIAL else char for char in path) + '/,DIRECT'
 
 
+def wildcard_entry(pattern):
+    """只有前导 *. 的条目按后缀处理；其余含 * 或 ? 的条目作为通配符，防止 *.com 这类过宽的写法。"""
+    if not WILDCARD_PATTERN.match(pattern):
+        return None
+    tail = pattern[max(pattern.rfind('*'), pattern.rfind('?')) + 1:]
+    domain = tail[1:] if tail.startswith('.') else ''
+    return pattern if '.' in domain and DOMAIN_PATTERN.match(domain) else None
+
+
 def whitelist_entry(text):
     """把一行输入规范化为 .app 路径、域名或 IP/网段；网址取主机名，*.、前导点与端口忽略。无法识别返回 None。"""
     if str(text).strip().startswith('/'):
@@ -1084,6 +1095,10 @@ def whitelist_entry(text):
     value = str(text).strip().lower()
     if not value or len(value) > 2048:
         return None
+    pattern = value.lstrip('*+.') if value.startswith(('*.', '+.')) else value
+    # 网址的查询串也含 ?，带 / 的输入一律按网址取主机名。
+    if '/' not in value and ('*' in pattern or '?' in pattern):
+        return wildcard_entry(pattern)
     candidates = [value]
     try:
         host = urllib.parse.urlsplit(value if '://' in value else '//' + value).hostname
@@ -1135,6 +1150,12 @@ def whitelist_rules(entries):
             if path is not None:
                 rules.append(process_rule(path))
             continue
+        if '/' not in str(entry) and ('*' in str(entry) or '?' in str(entry)):
+            # 内核的按域名 DNS 策略不支持半截通配符，这类条目只决定路由，解析沿用默认 DNS。
+            pattern = whitelist_entry(entry)
+            if pattern is not None:
+                rules.append('DOMAIN-WILDCARD,' + pattern + ',DIRECT')
+            continue
         try:
             network = ipaddress.ip_network(entry, strict=False)
         except ValueError:
@@ -1152,7 +1173,7 @@ def whitelist_rules(entries):
 def base_rules(rules):
     """去掉白名单规则，得到三种固定模式之一，用于判断当前模式。"""
     return rules[:WHITELIST_INDEX] + [rule for rule in rules[WHITELIST_INDEX:]
-                                      if not rule.startswith(('DOMAIN-SUFFIX,', 'IP-CIDR,', 'IP-CIDR6,', 'PROCESS-PATH-REGEX,')) or rule == 'IP-CIDR6,::/0,REJECT,no-resolve']
+                                      if not rule.startswith(('DOMAIN-SUFFIX,', 'IP-CIDR,', 'IP-CIDR6,', 'PROCESS-PATH-REGEX,', 'DOMAIN-WILDCARD,')) or rule == 'IP-CIDR6,::/0,REJECT,no-resolve']
 
 
 def generate_config(config, profile, relay, preferences):
